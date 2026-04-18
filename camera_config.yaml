@@ -2,5 +2,5 @@ resolution:
   width: 1280
   height: 720
 
-# Frame rate (fps). Set to null to leave at camera default.
+# Frame rate (fps). Set to null to leave at camera default (30).
 fps: null
