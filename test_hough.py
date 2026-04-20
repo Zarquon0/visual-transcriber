@@ -60,6 +60,51 @@ def make_mosaic(named_frames: list[tuple[str, np.ndarray]]) -> np.ndarray:
     return np.vstack(rows)
 
 
+def warp_key_lines(frame: np.ndarray, line_a: np.ndarray, line_b: np.ndarray, padding: int = 20) -> np.ndarray:
+    """Perspective-warp frame so that line_a and line_b form a rectangle."""
+    ax1, ay1, ax2, ay2 = line_a.astype(float)
+    bx1, by1, bx2, by2 = line_b.astype(float)
+
+    # Unit vector along line_a
+    dax, day = ax2 - ax1, ay2 - ay1
+    len_a = np.hypot(dax, day)
+    if len_a == 0:
+        return np.zeros((2 * padding, 2 * padding, 3), dtype=np.uint8)
+    ux, uy = dax / len_a, day / len_a
+
+    # Project line_b endpoints onto line_a direction for consistent left/right ordering
+    tb1 = (bx1 - ax1) * ux + (by1 - ay1) * uy
+    tb2 = (bx2 - ax1) * ux + (by2 - ay1) * uy
+    if tb1 <= tb2:
+        b_left, b_right = np.float32([bx1, by1]), np.float32([bx2, by2])
+    else:
+        b_left, b_right = np.float32([bx2, by2]), np.float32([bx1, by1])
+
+    a_left  = np.float32([ax1, ay1])
+    a_right = np.float32([ax2, ay2])
+
+    # Order into TL, TR, BR, BL by which line sits higher (smaller mean y)
+    if (ay1 + ay2) / 2 <= (by1 + by2) / 2:
+        src = np.float32([a_left, a_right, b_right, b_left])
+    else:
+        src = np.float32([b_left, b_right, a_right, a_left])
+
+    # Destination rectangle: width = len_a, height = perp distance between lines
+    mid_bx, mid_by = (bx1 + bx2) / 2, (by1 + by2) / 2
+    h = int(max(1, abs(day * (mid_bx - ax1) - dax * (mid_by - ay1)) / len_a))
+    w = int(len_a)
+
+    dst = np.float32([
+        [padding,         padding    ],
+        [padding + w,     padding    ],
+        [padding + w,     padding + h],
+        [padding,         padding + h],
+    ])
+
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(frame, M, (w + 2 * padding, h + 2 * padding))
+
+
 def normalize_and_threshold(frame: np.ndarray) -> np.ndarray:
     img = frame.astype(np.float32)
     for c in range(img.shape[2]):
@@ -115,6 +160,7 @@ def annotate_frame(frame: np.ndarray) -> np.ndarray:
 
     output = frame.copy()
     key_output = frame.copy()
+    warped = np.zeros_like(frame)
 
     if segments is not None and len(segments) > 0:
         top_segments = sorted(segments, key=segment_length, reverse=True)[:N_LINES]
@@ -133,22 +179,14 @@ def annotate_frame(frame: np.ndarray) -> np.ndarray:
         if parallel:
             farthest = max(parallel, key=lambda s: point_to_line_dist(
                 (s[0][0] + s[0][2]) / 2, (s[0][1] + s[0][3]) / 2, longest))
-            #print(farthest)
-
-            # mx = (farthest[0][0] + farthest[0][2]) / 2
-            # my = (farthest[0][1] + farthest[0][3]) / 2
-            # half = longest_len / 2
-            # ca, sa = np.cos(longest_angle), np.sin(longest_angle)
-            # new_seg = (int(mx - half * ca), int(my - half * sa),
-            #            int(mx + half * ca), int(my + half * sa))
 
             lx1, ly1, lx2, ly2 = longest[0]
             new_seg = farthest[0]
             cv2.line(key_output, (lx1, ly1), (lx2, ly2), LINE_COLOR, LINE_THICKNESS)
             cv2.line(key_output, new_seg[:2], new_seg[2:], (0, 255, 0), LINE_THICKNESS)
+            warped = warp_key_lines(frame, longest[0], new_seg, padding=20)
 
-
-    return threshed, blurred, edges, output, key_output
+    return threshed, blurred, edges, output, key_output, warped
 
 
 def stream_hough(stream: CanonStream, window_name: str = "hough_stream"):
@@ -159,13 +197,14 @@ def stream_hough(stream: CanonStream, window_name: str = "hough_stream"):
         if not grabbed or frame is None:
             print("Failed to read from camera")
             break
-        threshed, blurred, edges, output, key_output = annotate_frame(frame)
+        threshed, blurred, edges, output, key_output, warped = annotate_frame(frame)
         mosaic = make_mosaic([
             ("threshed", threshed),
             ("blurred", blurred),
             ("edges", edges),
             ("all lines", output),
             ("key lines", key_output),
+            ("warped", warped),
         ])
         cv2.imshow(window_name, mosaic)
         if cv2.waitKey(1) & 0xFF == 27:
