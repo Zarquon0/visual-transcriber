@@ -27,4 +27,11 @@ The algorithm is pretty brittle currently - it's somewhat unstable even in the b
 - ...the picked out "key" lines are not of the proper length or don't properly bound the keys, move the camera around, making sure all the keys of the piano are visible while moving closer to the piano (to cut out background pixels).
 - ...all else looks fine but the warped view seems unstable, that's just because it kind of is. It shouldn't be *that* unstable though if everything else looks fine.
 
+## Crop/Warp to Piano
+`key_extractor2.py` contains functionality attempting to segment/detect the keys on the keyboard. The code uses edge detection and sobel filtering as part of the functionality to find the white key and black key edges for piano. Still pending significant improvement. Line 242 is where you can adjust the threshold of how sensitive the edge detector is. Can be run in 2 views: live uses functionalities from what was originally test_hough (now seg_to_keys.py). 
+
+to run:
+static image (more stable): uv run key_extractor2.py --mode image --image test_piano.avif
+live: uv run key_extractor2.py --mode live
+
 
