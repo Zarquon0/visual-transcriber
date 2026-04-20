@@ -2,6 +2,9 @@
 # for a static image
 # /Users/billyan/Documents/2026/CSCI1430/uv run key_extractor2.py --mode live
 # for a live videofeed
+# this code uses edge detection to find the white key and black key edges for piano
+# line 242 is where you can adjust the threshold of how sensitive the edge detector is
+# If the edge score rises above a certain point "thresh", will mark that x coordinate and draw a vertical line down
 
 import argparse
 import cv2
@@ -239,7 +242,7 @@ def detect_white_key_boundaries_from_edges(
 
     med = float(np.median(edge_strength))
     p90 = float(np.percentile(edge_strength, 90))
-    thresh = med + 0.25 * max(1.0, (p90 - med))
+    thresh = med - 0.5 * max(1.0, (p90 - med))
 
     peaks = []
     for i in range(1, len(edge_strength) - 1):
