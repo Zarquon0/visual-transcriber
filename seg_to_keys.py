@@ -184,6 +184,12 @@ def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
     keys = frame.copy()
     warped = np.zeros_like(frame)
     if segments is not None and len(segments) > 0:
+        # Keep only near-horizontal segments so Hough can't pick vertical
+        # key-separator edges as a "rail".
+        horiz_tol_rad = 30 * np.pi / 180
+        horizontal = [s for s in segments
+                      if angle_diff(segment_angle(s), 0.0) <= horiz_tol_rad]
+        segments = horizontal if horizontal else list(segments)
         # Isolate keyboard bounding lines
         top_segments = sorted(segments, key=segment_length, reverse=True)[:N_LINES]
         first_rail = top_segments[0]
