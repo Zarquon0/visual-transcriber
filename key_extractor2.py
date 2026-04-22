@@ -10,13 +10,27 @@ import argparse
 import cv2
 import numpy as np
 
-from test_hough import (
-    load_image,
-    annotate_frame,
+# NOTE: `test_hough.py` was renamed to `seg_to_keys.py` and two functions
+# were renamed (`annotate_frame` → `warp_to_piano`, `stream_hough` →
+# `stream_to_piano`) in a later commit. These imports re-map the new names
+# back so this file runs unchanged. `load_image` no longer exists upstream;
+# a minimal local fallback is defined below.
+from seg_to_keys import (
     make_mosaic,
-    stream_hough,
-    open_canon_streams,
+    warp_to_piano as annotate_frame,
 )
+from stream_webcams import open_canon_streams
+
+
+def load_image(path: str) -> np.ndarray:
+    """Load an image by path, with a PIL fallback for AVIF and similar
+    formats that some OpenCV builds can't read."""
+    img = cv2.imread(path)
+    if img is not None:
+        return img
+    from PIL import Image
+
+    return cv2.cvtColor(np.array(Image.open(path).convert("RGB")), cv2.COLOR_RGB2BGR)
 
 
 # ── Key detector helpers ─────────────────────────────────────────────────────
