@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Output artifacts from calibration / batch-test scripts.
+auto_calib_result.png
+batch_result.png
+*_warped.png
+*_labeled.png
+*_calib.json
+snapshots/
