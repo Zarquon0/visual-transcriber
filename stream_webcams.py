@@ -51,7 +51,7 @@ for d in devices {
         (builtin if flag.strip() == "1" else external).append(name.strip())
 
     opencv_order = external + builtin
-    return [i for i, name in enumerate(opencv_order) if "Canon" in name]
+    return [i for i, name in enumerate(opencv_order) if "Canon" in name or "iPhone" in name]
 
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
