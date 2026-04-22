@@ -138,9 +138,74 @@ def warp_to_bbox(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarr
     return warp_key_lines(frame, top, bottom)
 
 
+BLACK_NOTE_SEMITONES = ["C#", "D#", "F#", "G#", "A#"]
+WHITE_NOTE_NAMES = ["C", "D", "E", "F", "G", "A", "B"]
+
+
+def _label_notes_61key(
+    black_centers: list[int],
+    start_octave: int = 2,
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Given N detected black-key center x-positions in warped coords, return
+    (black_labels, white_labels) where each entry is ``(x, "NoteName")``.
+
+    Assumes a 61-key board (leftmost black = C#2). If the count differs from
+    25, returns empty lists and lets the caller fall back to geometric-only
+    output. Gap pattern per octave is SWSSW (S = 1 white between adjacent
+    blacks, W = 2 whites between — the E-F and B-C gaps).
+    """
+    n = len(black_centers)
+    if n != 25:
+        return [], []
+    centers = sorted(black_centers)
+    black_labels = [(cx, f"{BLACK_NOTE_SEMITONES[i % 5]}{start_octave + i // 5}")
+                    for i, cx in enumerate(centers)]
+
+    # White letters progress starting at D (since leftmost black = C#,
+    # the white to its right is D).
+    gaps = np.diff(centers)
+    small_gap = float(np.median(sorted(gaps)[: max(1, len(gaps) // 2)]))
+    white_labels: list[tuple[int, str]] = []
+    white_idx = 1  # start at D (index 1 of WHITE_NOTE_NAMES)
+    octave = start_octave
+
+    # Left-of-first white = C{start_octave}.
+    white_labels.append((centers[0] - int(small_gap * 0.5), f"C{start_octave}"))
+
+    for i in range(n - 1):
+        a, b = centers[i], centers[i + 1]
+        gap = b - a
+        is_wide = gap > 1.5 * small_gap
+        if is_wide:
+            # 2 whites between.
+            for k, frac in enumerate((0.33, 0.66)):
+                letter = WHITE_NOTE_NAMES[white_idx % 7]
+                white_labels.append((a + int((b - a) * frac), f"{letter}{octave}"))
+                white_idx += 1
+                if white_idx % 7 == 0:
+                    octave += 1
+        else:
+            letter = WHITE_NOTE_NAMES[white_idx % 7]
+            white_labels.append(((a + b) // 2, f"{letter}{octave}"))
+            white_idx += 1
+            if white_idx % 7 == 0:
+                octave += 1
+
+    # Two more whites past the last black (B, then C next octave).
+    last = centers[-1]
+    for k in range(2):
+        letter = WHITE_NOTE_NAMES[white_idx % 7]
+        white_labels.append((last + int(small_gap * (0.5 + k * 0.7)),
+                             f"{letter}{octave}"))
+        white_idx += 1
+        if white_idx % 7 == 0:
+            octave += 1
+    return black_labels, white_labels
+
+
 # ── Labeler on a tight warp ──────────────────────────────────────────────────
 
-def draw_labels_tight_crop(warped: np.ndarray) -> np.ndarray:
+def draw_labels_tight_crop(warped: np.ndarray, label_notes: bool = True) -> np.ndarray:
     """Annotate a tight-keyboard-crop warped image with detected key features.
 
     Assumes the warped image height IS the keyboard (no body above, no floor
@@ -182,15 +247,34 @@ def draw_labels_tight_crop(warped: np.ndarray) -> np.ndarray:
     if ksz % 2 == 0:
         ksz += 1
     sm = np.convolve(col_mean, np.ones(ksz) / ksz, mode="same")
+    # Adaptive (local) threshold: a column is "dark" if it's meaningfully
+    # below the average brightness of its neighborhood — works across
+    # lighting gradients in the warp. Window is ~3-4 key widths wide so the
+    # local mean reflects the local white-surface brightness, not local keys.
+    win_size = max(51, int(w * 0.15))
+    if win_size % 2 == 0:
+        win_size += 1
+    # Reflect-pad so local_mean stays accurate near edges (convolve's default
+    # zero-padding biases the edge columns' local mean downward, causing the
+    # first/last keys to be missed).
+    half = win_size // 2
+    padded = np.concatenate([sm[half:0:-1], sm, sm[-2:-half - 2:-1]])
+    local_mean = np.convolve(padded, np.ones(win_size) / win_size, mode="valid")
+    dark_thr_arr = local_mean * 0.65
+    # Global floor so purely-noisy bright warps can't produce phantom dark
+    # columns: require sm to also be below 80% of the way from p10 to median.
     med = float(np.median(sm))
     p10 = float(np.percentile(sm, 10))
-    dark_thr = p10 + 0.35 * (med - p10)
-    dark = sm <= dark_thr
-
-    # Merge small gaps (prevents splitting one key into multiple runs).
-    gap_merge = max(2, int(0.005 * w))
-    i = 0
+    global_floor = p10 + 0.8 * (med - p10)
+    dark_thr_arr = np.minimum(dark_thr_arr, global_floor)
+    dark_thr = float(np.mean(dark_thr_arr))  # kept for downstream reuse
+    dark = sm <= dark_thr_arr
     n = len(dark)
+
+    # Merge tiny gaps so a single key's dark region with micro-noise doesn't
+    # fragment. Gap must be < ~10% of white-key-width.
+    gap_merge = max(2, int(0.1 * (w / 36)))
+    i = 0
     while i < n:
         if not dark[i]:
             j = i
@@ -202,11 +286,18 @@ def draw_labels_tight_crop(warped: np.ndarray) -> np.ndarray:
         else:
             i += 1
 
-    # For each dark run, trace actual key polygon (supports chamfered shapes).
+    # Each contiguous dark run = one black key. This naturally handles
+    # adjacent keys (separated by a bright "white-between-blacks" run) as
+    # distinct keys, avoiding the min-sep collapse of the local-minima
+    # approach.
     expected_bk = w / 60
-    min_w = max(4, int(0.5 * expected_bk))
+    min_w = max(3, int(0.35 * expected_bk))
     max_w = max(min_w + 1, int(1.6 * expected_bk))
     row_dark_thr = dark_thr + 0.3 * (med - dark_thr)
+    # Looser threshold used to EXPAND the x-extent outward so anti-aliased
+    # key-edge pixels are included in the contour even when they aren't
+    # dark enough to form the initial run.
+    extent_thr = dark_thr + 0.7 * (med - dark_thr)
     black_rects: list[tuple[int, int, int, int]] = []
     black_polys: list[np.ndarray | None] = []
     vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
@@ -218,9 +309,18 @@ def draw_labels_tight_crop(warped: np.ndarray) -> np.ndarray:
                 j += 1
             bw = j - i
             if min_w <= bw <= max_w:
-                pad_x = max(2, bw // 3)
-                x0_k = max(0, i - pad_x)
-                x1_k = min(w, j + pad_x)
+                # Expand outward using extent_thr so anti-aliased key edges
+                # get included. Walk left/right while col-brightness stays
+                # under extent_thr. Stops before hitting a neighboring key's
+                # bright surface.
+                left = i
+                while left > 0 and sm[left - 1] <= extent_thr and (i - left) < bw:
+                    left -= 1
+                right = j - 1
+                while right < len(sm) - 1 and sm[right + 1] <= extent_thr and (right - (j - 1)) < bw:
+                    right += 1
+                x0_k = max(0, left)
+                x1_k = min(w, right + 1)
                 strip_img = upper[:, x0_k:x1_k]
                 dark_mask = (strip_img <= row_dark_thr).astype(np.uint8) * 255
                 dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, vkernel)
@@ -228,7 +328,7 @@ def draw_labels_tight_crop(warped: np.ndarray) -> np.ndarray:
                 poly = None
                 if cc:
                     biggest = max(cc, key=cv2.contourArea)
-                    if cv2.contourArea(biggest) >= 0.25 * bw * y_black_bottom:
+                    if cv2.contourArea(biggest) >= 0.2 * bw * y_black_bottom:
                         eps = max(0.5, 0.002 * cv2.arcLength(biggest, True))
                         approx = cv2.approxPolyDP(biggest, eps, True)
                         poly = approx + np.array([[[x0_k, 0]]], dtype=np.int32)
@@ -249,38 +349,55 @@ def draw_labels_tight_crop(warped: np.ndarray) -> np.ndarray:
                 dtype=np.int32,
             ))
 
-    # --- White-key seams via Sobel-x in the pure-white lower band ---
-    white_band_top = y_black_bottom + int(0.1 * (h - y_black_bottom))
-    band = gray[white_band_top:h - 1, :]
-    sobel_x = np.abs(cv2.Sobel(band, cv2.CV_32F, 1, 0, ksize=3))
-    col_strength = sobel_x.mean(axis=0)
-    sig = np.convolve(col_strength, np.ones(9) / 9, mode="same")
-    med2 = float(np.median(sig))
-    p90 = float(np.percentile(sig, 90))
-    thr = med2 + 0.2 * max(1.0, p90 - med2)
-    peaks: list[int] = []
-    for i in range(2, len(sig) - 2):
-        c = sig[i]
-        if c >= thr and c >= sig[i - 1] and c >= sig[i + 1]:
-            peaks.append(i)
-    min_sep = max(4, int(w / 72))
-    merged: list[int] = []
-    for p in peaks:
-        if merged and p - merged[-1] < min_sep:
-            continue
-        merged.append(p)
+    # --- White-key seams via column-brightness valleys in the pure-white
+    # region (vision-based, analogous to how we detect black keys).
+    # Seams are DARK vertical lines between adjacent white keys — narrower
+    # but darker than the surrounding bright key surfaces. Local minima in
+    # per-column mean brightness, below the median minus a margin.
+    band_top = y_black_bottom + int(0.15 * (h - y_black_bottom))
+    band_bot = h - 2
+    white_band = gray[band_top:band_bot, :]
+    col_mean_wh = white_band.mean(axis=0)
+    # Smooth lightly to kill pixel-noise minima.
+    k_wh = max(3, int(w / 500))
+    if k_wh % 2 == 0:
+        k_wh += 1
+    sm_wh = np.convolve(col_mean_wh, np.ones(k_wh) / k_wh, mode="same")
+    med_wh = float(np.median(sm_wh))
+    p25_wh = float(np.percentile(sm_wh, 25))
+    seam_thr = p25_wh + 0.7 * (med_wh - p25_wh)
+    # Minimum spacing between seams ~ 60% of a typical white-key width,
+    # derived from detected black-key spacing (black spacing ≈ white width).
+    black_centers_sorted = sorted(int(x + bw2 / 2) for (x, _, bw2, _) in black_rects)
+    if len(black_centers_sorted) >= 2:
+        gaps = np.diff(black_centers_sorted)
+        sorted_gaps = np.sort(gaps)
+        small_gap = float(np.median(sorted_gaps[: max(1, len(sorted_gaps) // 2)]))
+    else:
+        small_gap = w / 36.0
+    min_sep = max(4, int(0.6 * small_gap))
+    seam_peaks: list[int] = []
+    for i in range(1, len(sm_wh) - 1):
+        if sm_wh[i] <= seam_thr and sm_wh[i] <= sm_wh[i - 1] and sm_wh[i] <= sm_wh[i + 1]:
+            if seam_peaks and i - seam_peaks[-1] < min_sep:
+                if sm_wh[i] < sm_wh[seam_peaks[-1]]:
+                    seam_peaks[-1] = i
+            else:
+                seam_peaks.append(i)
 
-    black_xs = [(x - 2, x + bw2 + 2) for (x, _, bw2, _) in black_rects]
-
-    def black_key_above(px: int) -> bool:
-        return any(lo <= px <= hi for lo, hi in black_xs)
-
-    seam_full: list[int] = []
+    # Classify each detected seam as partial (aligned with a black key above)
+    # or full-height (no black above — E|F / B|C gap). Tolerance is a
+    # fraction of the measured unit spacing so slight detection-center
+    # offsets from true seam don't misclassify.
+    tolerance = max(8, int(0.35 * small_gap))
     seam_white_only: list[int] = []
-    for bx in merged:
-        (seam_full if not black_key_above(bx) else seam_white_only).append(bx)
+    seam_full: list[int] = []
+    for bx in seam_peaks:
+        aligned_with_black = any(abs(bx - cx) <= tolerance
+                                 for cx in black_centers_sorted)
+        (seam_white_only if aligned_with_black else seam_full).append(bx)
 
-    # --- Draw ---
+    # --- Draw geometric markers ---
     cv2.line(out, (0, y_black_bottom), (w - 1, y_black_bottom), (0, 0, 255), 2)
     for bx in seam_white_only:
         cv2.line(out, (bx, y_black_bottom + 2), (bx, h - 1), (0, 255, 255), 2)
@@ -288,6 +405,24 @@ def draw_labels_tight_crop(warped: np.ndarray) -> np.ndarray:
         cv2.line(out, (bx, 0), (bx, h - 1), (0, 255, 255), 2)
     if black_contours:
         cv2.drawContours(out, black_contours, -1, (255, 0, 0), 2)
+
+    # --- Note labels (assumes 61-key board, leftmost black = C#2) ---
+    if label_notes:
+        black_centers = sorted(int(x + bw_ / 2) for (x, _, bw_, _) in black_rects)
+        bl, wl = _label_notes_61key(black_centers)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.7
+        for cx, name in bl:
+            (tw, th), _ = cv2.getTextSize(name, font, scale, 2)
+            pos = (cx - tw // 2, y_black_bottom - 6)
+            cv2.putText(out, name, pos, font, scale, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(out, name, pos, font, scale, (0, 255, 255), 2, cv2.LINE_AA)
+        for cx, name in wl:
+            if 0 <= cx < w:
+                (tw, th), _ = cv2.getTextSize(name, font, scale, 2)
+                pos = (cx - tw // 2, h - 10)
+                cv2.putText(out, name, pos, font, scale, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(out, name, pos, font, scale, (0, 200, 0), 2, cv2.LINE_AA)
     return out
 
 

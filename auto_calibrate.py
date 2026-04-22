@@ -38,6 +38,12 @@ from key_labeler import load_image, draw_labels_tight_crop
 from seg_to_keys import isolate_white
 
 
+# Physical piano geometry: black keys are ~0.60 (acoustic) to ~0.70
+# (MIDI controllers) as tall as white keys. Used to infer where key tops
+# end from measured black-key height.
+BLACK_TO_WHITE_KEY_HEIGHT_RATIO = 0.70
+
+
 def _column_extrema(mask: np.ndarray):
     """Per-column topmost and bottommost white-pixel y, or -1 if empty."""
     h, w = mask.shape
@@ -286,6 +292,129 @@ def find_corners_auto(frame: np.ndarray, debug: bool = False):
     return corners
 
 
+def tighten_corners_to_tops(
+    frame: np.ndarray,
+    loose_corners: np.ndarray,
+    ratio: float = BLACK_TO_WHITE_KEY_HEIGHT_RATIO,
+) -> np.ndarray:
+    """Return a tightened corner set that excludes key front-faces.
+
+    Uses the black-key geometry as a yardstick: after warping with the loose
+    corners, detect y_black_top and y_black_bottom in the warp, compute the
+    expected end of key tops (y_black_top + black_height / ratio), and
+    inverse-project that line back to original-image coords to replace the
+    bottom rail. The returned corners produce a warp tight to the physical
+    top surfaces of the keys, without fronts/shadows/body below.
+
+    Falls back to the input loose_corners if the refinement can't be applied
+    reliably (e.g., black keys not clearly detectable in the warp).
+    """
+    tl, tr, br, bl = loose_corners
+    try:
+        warp_out_h = 220
+        top_len = float(np.linalg.norm(tr - tl))
+        bot_len = float(np.linalg.norm(br - bl))
+        left_len = float(np.linalg.norm(bl - tl))
+        right_len = float(np.linalg.norm(br - tr))
+        avg_w = (top_len + bot_len) / 2
+        avg_h = (left_len + right_len) / 2
+        out_w = max(100, int(avg_w * warp_out_h / max(1.0, avg_h)))
+        dst = np.array([
+            [0, 0], [out_w - 1, 0], [out_w - 1, warp_out_h - 1], [0, warp_out_h - 1],
+        ], dtype=np.float32)
+        M_forward = cv2.getPerspectiveTransform(loose_corners.astype(np.float32), dst)
+        M_inverse = np.linalg.inv(M_forward)
+        warp_preview = cv2.warpPerspective(frame, M_forward, (out_w, warp_out_h))
+
+        g_prev = cv2.cvtColor(warp_preview, cv2.COLOR_BGR2GRAY)
+        sy = cv2.Sobel(g_prev, cv2.CV_32F, 0, 1, ksize=3)
+        dl = np.clip(sy, 0, None).sum(axis=1)
+        s_db = dl[: int(0.75 * warp_out_h)].copy()
+        s_db[: int(0.1 * warp_out_h)] = 0
+        y_black_bottom_w = int(np.argmax(s_db))
+        ld = np.clip(-sy, 0, None).sum(axis=1)
+        top_search_end = min(y_black_bottom_w - 5, int(0.4 * warp_out_h))
+        if top_search_end > 3:
+            s_ld = ld[:top_search_end]
+            peak_ld = float(s_ld.max()); med_ld = float(np.median(s_ld))
+            y_black_top_w = int(np.argmax(s_ld)) if peak_ld > 3.0 * max(1.0, med_ld) else 0
+        else:
+            y_black_top_w = 0
+
+        bh_w = y_black_bottom_w - y_black_top_w
+        if bh_w <= 10:
+            return loose_corners
+        wh_w = int(bh_w / ratio)
+        expected_bot_w = y_black_top_w + wh_w
+        if not (y_black_bottom_w + 5 < expected_bot_w < warp_out_h - 2):
+            return loose_corners
+
+        # Inverse-project the expected-bottom line back to original coords.
+        p_l_warp = np.array([[0, expected_bot_w]], dtype=np.float32).reshape(-1, 1, 2)
+        p_r_warp = np.array([[out_w - 1, expected_bot_w]], dtype=np.float32).reshape(-1, 1, 2)
+        new_bl = cv2.perspectiveTransform(p_l_warp, M_inverse)[0, 0]
+        new_br = cv2.perspectiveTransform(p_r_warp, M_inverse)[0, 0]
+        return np.stack([tl, tr, new_br, new_bl]).astype(np.float32)
+    except Exception:
+        return loose_corners
+
+
+def _trim_warp_bottom(warped: np.ndarray) -> np.ndarray:
+    """Trim the warp bottom to the *computed* end of the white key tops,
+    using black keys as a yardstick. Black keys are ~60% as tall as white
+    keys on every piano, so:
+
+        white_key_height = black_key_height / 0.60
+
+    We detect y_black_top (first strong light→dark row, the top of the
+    blacks) and y_black_bottom (strongest dark→light, the bottom of blacks).
+    Trim at y_black_top + white_key_height. No fragile edge-detection in
+    the key-fronts region needed.
+    """
+    if warped is None or warped.size < 100:
+        return warped
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+    # y_black_bottom: strongest DARK→LIGHT horizontal edge (blacks end, whites begin).
+    dark_to_light = np.clip(sobel_y, 0, None).sum(axis=1)
+    s_db = dark_to_light[: int(0.75 * h)].copy()
+    s_db[: int(0.1 * h)] = 0
+    y_black_bottom = int(np.argmax(s_db))
+
+    # y_black_top: strongest LIGHT→DARK row in the TOP 40% of the warp.
+    # This bounds away from y_black_bottom (which has strong gradient bleed
+    # from the main black/white boundary). For tight warps the blacks start
+    # near y=0 so the search often finds no strong top edge — fall back.
+    light_to_dark = np.clip(-sobel_y, 0, None).sum(axis=1)
+    search_top_end = min(y_black_bottom - 5, int(0.4 * h))
+    if search_top_end > 3:
+        s_ld = light_to_dark[:search_top_end].copy()
+        peak_ld = float(s_ld.max())
+        med_ld = float(np.median(s_ld))
+        if peak_ld > 3.0 * max(1.0, med_ld):
+            y_black_top = int(np.argmax(s_ld))
+        else:
+            y_black_top = 0
+    else:
+        y_black_top = 0
+
+    # Physical-ratio trim: black keys are ~BLACK_TO_WHITE_KEY_HEIGHT_RATIO
+    # as tall as white keys (piano geometry). Compute expected white-key
+    # bottom from measured black-key height; trim there if it's meaningfully
+    # above the current warp bottom.
+    black_height = y_black_bottom - y_black_top
+    if black_height <= 5:
+        return warped
+    white_height = int(black_height / BLACK_TO_WHITE_KEY_HEIGHT_RATIO)
+    expected_bottom = y_black_top + white_height
+    if expected_bottom < h - 3 and expected_bottom > y_black_bottom + 5:
+        return warped[:expected_bottom + 1, :, :]
+    return warped
+
+
 def warp_from_corners(img: np.ndarray, corners: np.ndarray, out_height: int = 220):
     tl, tr, br, bl = corners
     top_len = float(np.linalg.norm(tr - tl))
@@ -318,9 +447,13 @@ def process_one(path: str):
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3, cv2.LINE_AA)
     cv2.polylines(vis, [pts_int.reshape(-1, 1, 2)], True, (0, 255, 0), 4)
 
-    warped = warp_from_corners(img, corners)
-    labeled = draw_labels_tight_crop(warped)
-    return name, vis, warped, labeled
+    # Two warps: loose (includes key fronts — future press detection) and
+    # tight (just key tops — for labeling).
+    warped_loose = warp_from_corners(img, corners)
+    tight_corners = tighten_corners_to_tops(img, corners)
+    warped_tight = warp_from_corners(img, tight_corners)
+    labeled = draw_labels_tight_crop(warped_tight)
+    return name, vis, warped_loose, labeled
 
 
 CELL_W, CELL_H = 720, 360
