@@ -35,3 +35,33 @@ static image (more stable): uv run key_extractor2.py --mode image --image test_p
 live: uv run key_extractor2.py --mode live
 
 
+## Auto Calibration + Tight-Crop Labeler (alternate pipeline)
+
+An alternative detection pipeline lives in `auto_calibrate.py` + `key_labeler.py`, operating on **static images** rather than live streams. The Hough-based warp in `seg_to_keys.py` picks background horizontals (shelves, floor tiles) as keyboard rails on real hand-held photos, and the labeler in `key_extractor2.py` assumes the warp leaves padding above/below the keys. This alt pipeline works on *tight* warps where the whole warped image is the keyboard.
+
+### iPhone Continuity Camera
+
+`stream_webcams.py`'s device filter accepts iPhones now, so Continuity Camera works for `key_extractor2.py --mode live` without needing Canon hardware. The alt pipeline scripts below are all static-image; they don't use streams.
+
+### Scripts
+- **`key_labeler.py`** — core detection + labeling. Uses a simple axis-aligned bbox crop (via `find_keyboard_bbox`). Run on a single photo:
+  ```
+  uv run python key_labeler.py path/to/photo.jpg
+  ```
+  Writes `<photo>_labeled.png` next to the input.
+- **`auto_calibrate.py`** — automatic 4-corner detection via blob geometry + RANSAC rail fit on all 4 sides (proper trapezoidal perspective warp, not axis-aligned). Then the labeler. Run on one or more photos:
+  ```
+  uv run python auto_calibrate.py piano_photos/IMG_9064.jpg piano_photos/IMG_9066.jpg
+  ```
+  Writes `auto_calib_result.png` — a grid with `corners | warped | warped+labels` per input.
+- **`manual_calibrate.py`** — fallback 4-click calibration for shots where auto fails. Click TL, TR, BR, BL. Saves three artifacts next to the input photo: `<photo>_warped.png`, `<photo>_labeled.png`, `<photo>_calib.json` (corners in original-image coords).
+
+### Labeler output
+On the warped keyboard image:
+- Red horizontal line = detected black/white boundary (`y_black_bottom`)
+- Blue polygons = actual pixel contours of black keys (not axis-aligned rectangles, so perspective slant and chamfered fronts are preserved)
+- Yellow vertical lines = white-key seams. Full-height at E-F / B-C gaps (no black key interrupting); below the red line elsewhere.
+
+### Known issues
+- `IMG_9073` (front-on, keyboard is a narrow horizontal strip in the frame) still has drift in yellow-seam placement even though the warp itself is decent. Top-down-ish shots like 9064 and 9066 work well end-to-end.
+- Auto calibration's left/right rail fit is pre-filtered to the outermost 40% of points (see the percentile pre-filter in `find_corners_auto`) so shadow-edge rows don't drag the rail inward. If it still misses rightmost keys on your photos, relaxing that percentile is the first knob to try; falling back to `manual_calibrate.py` is the second.
