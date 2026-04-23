@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 
 from seg_to_keys import isolate_white, warp_key_lines
+from stream_webcams import open_canon_streams
 
 
 def load_image(path: str) -> np.ndarray:
