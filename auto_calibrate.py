@@ -179,7 +179,15 @@ def find_corners_auto(frame: np.ndarray, debug: bool = False):
     pure_white_bot = y_bot_mid
     y_top_min = max(0, pure_white_top)
     y_bot_max = min(H - 1, pure_white_bot)
-    sub_mask = mask[y_top_min:y_bot_max + 1]
+    # Restrict per-row leftmost/rightmost sampling to the raw-whites
+    # intersected with a mildly-dilated blob mask. The blob mask prevents
+    # far-away bright clutter (ceiling lights, shelves, reflections in
+    # wide-frame shots) from polluting the rail fit, while the dilation
+    # (~1% of frame width) preserves anti-aliased key edges just past the
+    # blob boundary so keys aren't artificially clipped.
+    blob_dilated = cv2.dilate(blob, np.ones((1, max(5, W // 100)), np.uint8))
+    combined = cv2.bitwise_and(mask, blob_dilated)
+    sub_mask = combined[y_top_min:y_bot_max + 1]
     sub_h = sub_mask.shape[0]
     row_any = sub_mask > 0
     has_any = row_any.any(axis=1)
