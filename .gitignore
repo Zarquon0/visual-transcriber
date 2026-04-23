@@ -11,6 +11,6 @@ batch_result.png
 *_labeled.png
 *_warp_raw.png
 *_trim_compare.png
-*_calib.json
+# NOTE: *_calib.json is NOT ignored — calibration files are reusable per camera mount.
 snapshots/
 piano_photos/_*.png
