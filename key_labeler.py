@@ -1,26 +1,40 @@
 """Piano keyboard detection + labeling pipeline.
 
-This module implements an alternative detection pipeline to the labeler
-in ``key_extractor2.py``, tuned for *tight* keyboard crops (where the whole
-warped image IS the keyboard region, no surrounding body/floor). The crop
-is produced either by:
+This module implements detection + labeling for *tight* keyboard crops
+(where the whole warped image IS the keyboard region, no surrounding
+body/floor). The crop is produced either by:
 
-1. ``find_keyboard_bbox`` in this file (heuristic auto-crop), or
+1. ``find_keyboard_bbox`` in this file (heuristic axis-aligned crop), or
 2. ``auto_calibrate.find_corners_auto`` (trapezoidal perspective warp), or
 3. ``manual_calibrate`` (4-click manual corners).
 
-The labeler then annotates the warped keys with:
+The labeler annotates the warped keys with:
 
 - a red horizontal line at the dynamically-detected black/white boundary
-- blue polygons around each detected black key (actual pixel shape, not
-  axis-aligned rectangles, so perspective slant and chamfered fronts are
-  preserved)
-- yellow vertical lines at white-key seams (full-height at E-F / B-C
-  gaps where no black key interrupts; below the red line elsewhere)
+- blue polygons around each detected black key (actual pixel shape, with
+  the per-blob template projection giving consistent key contours even
+  on heavy side-view warps where individual key bodies look rectangular)
+- yellow vertical lines at white-key seams, drawn through every row
+  where no black-key polygon covers the seam's column (= unified rule:
+  full-height in E-F/B-C gaps, clipped above polygon-covered rows)
 
-The black-key detection uses *column-brightness valleys* (dark columns =
-black keys) instead of Otsu on the upper band, which was merging adjacent
-keys into a single blob on angled photos.
+Black-key detection (`_detect_blacks_2d`) uses 2D Otsu connected-component
+on the upper band, then splits merged blobs at U-valley positions in the
+blob's bottom-y profile. For each merged blob it picks the camera-FAR
+outer piece's actual contour as a local template and projects it onto
+the inner pieces — the template carries the only "complete" key shape
+in the blob, since inner keys have ambiguous boundaries shared with
+neighbours. Z-order clipping handles overlap between projected pieces:
+the closer piece wins.
+
+White-key seam detection uses Sobel-x on the white band (vertical-edge
+strength per column) + local-median gap-fill for missed seams + edge
+extrapolation past the first/last detected seam.
+
+A `far_side` parameter (``"right"`` or ``"left"``) selects which outer
+piece of each merged blob is used as the local template — set this to
+the camera-far direction. When two cameras run as a pair, each cam
+passes its own ``far_side`` and its results are fused downstream.
 """
 
 from __future__ import annotations
@@ -173,10 +187,16 @@ def _label_notes_61key(
     # Left-of-first white = C{start_octave}.
     white_labels.append((centers[0] - int(small_gap * 0.5), f"C{start_octave}"))
 
+    # Use the CANONICAL SWSSW pattern hardcoded for a 61-key board (5
+    # octaves of black keys: SWSSW * 4 cross-octave Ws + SWSS for the
+    # last partial octave). 24 chars. More robust than per-gap S/W
+    # classification, which can misclassify borderline wide gaps when
+    # perspective compresses the wide-gap differential.
+    canonical = ("SWSSW" * 5)[:24]
+
     for i in range(n - 1):
         a, b = centers[i], centers[i + 1]
-        gap = b - a
-        is_wide = gap > 1.5 * small_gap
+        is_wide = canonical[i] == "W"
         if is_wide:
             # 2 whites between.
             for k, frac in enumerate((0.33, 0.66)):
@@ -243,22 +263,46 @@ def _split_blob_by_xclip(
     bot_sm = np.convolve(bottom_y, np.ones(k_s) / k_s, mode="same")
     candidates = []
     margin = max(2, bw // 20)
+    # Catch plateau-left-edges as valleys: a flat bottom of a U-valley
+    # (multiple consecutive equal values at the deepest point) wouldn't
+    # be caught by strict <. Use < on the left and <= on the right so
+    # the plateau's left edge becomes the valley position.
     for i in range(margin, bw - margin):
-        if bot_sm[i] < bot_sm[i - 1] and bot_sm[i] < bot_sm[i + 1]:
+        if bot_sm[i] < bot_sm[i - 1] and bot_sm[i] <= bot_sm[i + 1]:
             candidates.append(i)
-    # Trust the real valleys we find. If fewer than n_keys-1 of them,
-    # adjust the key count downward — better to merge two keys into one
-    # outline than to hallucinate extra keys via synthetic valleys.
-    # (Synthetic-valley splitting tends to over-count when a blob spans
-    # a "wide" white-only gap (E-F or B-C), which adds ~1 key-width of
-    # phantom pixels without any actual key there.)
-    candidates.sort(key=lambda i: bot_sm[i])
-    valleys = sorted(candidates[: n_keys - 1])
-    if len(valleys) < n_keys - 1:
-        n_keys = len(valleys) + 1
+    # Filter spurious local minima from noise/distortion within a single
+    # key body via three layers, each robust to camera angle:
+    #   1. MIN SPACING: real U-valleys are at least ~half a key-width
+    #      apart geometrically (adjacent keys can't be packed closer).
+    #   2. MAX VALLEY COUNT: a blob of width bw fits at most
+    #      round(bw / median_w) keys, so it has at most that many minus
+    #      1 real U-valleys. Greedy by depth keeps the strongest dips.
+    #   3. MIN PROMINENCE: small absolute floor (≥2 px below local peak)
+    #      rejects flat-region noise on extremely uniform far-blobs.
+    win = max(margin, int(0.5 * target_w))
+    min_spacing = max(3, int(0.5 * target_w))
+    max_valleys = max(0, int(round(bw / target_w)) - 1)
+
+    def _prominence(i: int) -> float:
+        lo = max(0, i - win)
+        hi = min(bw, i + win + 1)
+        return float(bot_sm[lo:hi].max()) - float(bot_sm[i])
+
+    candidates.sort(key=lambda i: bot_sm[i])  # deepest first
+    selected: list[int] = []
+    for c in candidates:
+        if len(selected) >= max_valleys:
+            break
+        if _prominence(c) < 2.0:
+            continue
+        if any(abs(c - v) < min_spacing for v in selected):
+            continue
+        selected.append(c)
+    valleys = sorted(selected)
+    n_keys = len(valleys) + 1
     if n_keys < 2:
         return None
-    splits = [0] + sorted(valleys) + [bw]
+    splits = [0] + valleys + [bw]
 
     def _piece_contour(x_lo: int, x_hi: int) -> np.ndarray | None:
         m = np.zeros_like(local)
@@ -454,16 +498,56 @@ def _detect_blacks_2d(
                 eps = max(0.5, 0.002 * cv2.arcLength(sub_poly, True))
                 polys.append(cv2.approxPolyDP(sub_poly, eps, True))
         else:
-            # No usable U-valleys / template: even-spaced rect fallback.
-            piece_w = bw_ / n_keys
-            for k in range(n_keys):
-                px = int(x_ + k * piece_w)
-                pw = int(piece_w)
-                rects.append((px, y_, pw, bh_))
-                polys.append(np.array([
-                    [[px, y_]], [[px + pw, y_]],
-                    [[px + pw, y_ + bh_]], [[px, y_ + bh_]],
-                ], dtype=np.int32))
+            # Splitter couldn't find enough U-valleys — use the blob's
+            # ACTUAL contour as one polygon. Under-counts keys but at
+            # least the polygon traces real pixel edges (vs. the prior
+            # axis-aligned-bounding-box fallback that drew fake rects).
+            rects.append((x_, y_, bw_, bh_))
+            eps = max(0.5, 0.002 * cv2.arcLength(contour, True))
+            polys.append(cv2.approxPolyDP(contour, eps, True))
+    # Geometric edge guard for the 61-key C-to-C keyboard layout.
+    # The keyboard's leftmost white is C2 (so first black-key C#2 sits
+    # ~0.7 white-keys from the left edge) and rightmost white is C7
+    # preceded by B6 (so last black-key A#6 sits ~1.5 white-keys from
+    # the right edge). Any polygon whose outer x extends past these
+    # geometric caps is over-extending into the white-key buffer area
+    # — likely from Otsu including warp-edge dark artifacts. Trim it.
+    # This is symmetric across camera angles because the keyboard's
+    # layout doesn't depend on which side the camera is on.
+    white_key_w = w / 36.0
+    left_geom_cap = max(2, int(0.5 * white_key_w))
+    right_geom_cap = max(left_geom_cap + 1, w - int(1.5 * white_key_w))
+
+    def _trim_poly_x(p: np.ndarray, x_lo: int, x_hi: int) -> np.ndarray:
+        """Clip polygon to x in [x_lo, x_hi] via rasterize → mask →
+        re-extract. Preserves the polygon's actual edge shape on the
+        un-clipped sides.
+        """
+        if int(p[:, 0, 0].min()) >= x_lo and int(p[:, 0, 0].max()) <= x_hi:
+            return p
+        bb_x, bb_y, bw_p, bh_p = cv2.boundingRect(p)
+        pad = 2
+        pmask = np.zeros((bh_p + 2 * pad, bw_p + 2 * pad), dtype=np.uint8)
+        p_local = p - np.array([[[bb_x - pad, bb_y - pad]]], dtype=np.int32)
+        cv2.drawContours(pmask, [p_local], -1, 1, thickness=-1)
+        cap_lo = max(0, x_lo - (bb_x - pad))
+        cap_hi = min(pmask.shape[1], x_hi - (bb_x - pad) + 1)
+        if cap_lo > 0:
+            pmask[:, :cap_lo] = 0
+        if cap_hi < pmask.shape[1]:
+            pmask[:, cap_hi:] = 0
+        cs, _ = cv2.findContours(pmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not cs:
+            return p
+        c = max(cs, key=cv2.contourArea)
+        return c + np.array([[[bb_x - pad, bb_y - pad]]], dtype=np.int32)
+
+    for i in range(len(polys)):
+        new_p = _trim_poly_x(polys[i], left_geom_cap, right_geom_cap)
+        if new_p is not polys[i]:
+            polys[i] = new_p
+            rects[i] = cv2.boundingRect(new_p)
+
     order = sorted(range(len(rects)), key=lambda k: rects[k][0])
     return [rects[k] for k in order], [polys[k] for k in order]
 
@@ -667,17 +751,26 @@ def draw_labels_tight_crop(
 ) -> np.ndarray:
     """Annotate a tight-keyboard-crop warped image with detected key features.
 
-    Assumes the warped image height IS the keyboard (no body above, no floor
-    below). Detects:
+    Assumes the warped image height IS the keyboard (no body above, no
+    floor below). Pipeline:
 
-    - the black/white horizontal boundary (``y_black_bottom``) via the
-      strongest dark→light horizontal edge (Sobel-y)
-    - black keys as polygons via column-brightness valleys in the upper band
-      (adjacent dark columns = one black key), then per-key Otsu within a
-      narrow x-strip to trace the actual pixel contour
-    - white-key seams via Sobel-x peaks in the lower band (drawn below the
-      red line when a black key sits above, full-height otherwise for the
-      E-F / B-C gaps)
+    - Find ``y_black_bottom`` (the black/white boundary) via the strongest
+      dark→light horizontal edge (Sobel-y) in the upper portion.
+    - Detect black keys via 2D Otsu connected components, splitting any
+      merged blob with U-valley analysis + per-blob far-template projection
+      (``_detect_blacks_2d``); fall back to 1D column-projection
+      (``_detect_blacks_1d``) when 2D yields too few keys.
+    - Project the resulting set to the canonical 25 black-key positions
+      using SWSSW-pattern alignment (``_project_to_25``), filling missing
+      keys with translated template polygons.
+    - Detect white-key seams via Sobel-x on the white band; gap-fill and
+      edge-extrapolate to cover all expected ~37 boundaries.
+    - Draw each seam through every row where no black-key polygon covers
+      the seam's column (one unified rule for partial vs full-height).
+
+    ``far_side``: which side of the warp is the camera-FAR side
+    (``"right"`` or ``"left"``); used by the per-blob splitter to pick
+    the local template piece. Set per-camera in a dual-cam rig.
     """
     if warped is None or warped.size == 0:
         return np.zeros((360, 640, 3), dtype=np.uint8)
@@ -720,12 +813,14 @@ def draw_labels_tight_crop(
                 dtype=np.int32,
             ))
 
-    # --- White-key seams: independent column-brightness valley detection.
-    # Seams are dark vertical valleys between bright white-key surfaces,
-    # detected directly from the white band — no dependency on the black
-    # key list for *position*. Black-key centers are used afterward only
-    # to classify each detected seam as partial (a black sits above it)
-    # vs full-height (E|F or B|C, no black above).
+    # --- White-key seams: Sobel-x peak detection on the white band.
+    # Sum of |∂I/∂x| down each column gives a strong peak at every seam,
+    # even when the seam itself is only marginally darker than the white
+    # surface (low-contrast side-view warps where a pure column-mean
+    # valley would collapse into noise). We don't depend on the
+    # black-key list for *position*; black-key polygons are used
+    # afterward only by the per-row drawing rule (skip rows where a
+    # polygon covers).
     band_top = y_black_bottom + int(0.15 * (h - y_black_bottom))
     band_bot = h - 2
     white_band = gray[band_top:band_bot, :] if band_bot > band_top else gray[band_top:, :]
@@ -851,18 +946,40 @@ def draw_labels_tight_crop(
         black_centers = sorted(int(x + bw_ / 2) for (x, _, bw_, _) in black_rects)
         bl, wl = _label_notes_61key(black_centers)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.7
-        for cx, name in bl:
-            (tw, th), _ = cv2.getTextSize(name, font, scale, 2)
-            pos = (cx - tw // 2, y_black_bottom - 6)
-            cv2.putText(out, name, pos, font, scale, (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(out, name, pos, font, scale, (0, 255, 255), 2, cv2.LINE_AA)
-        for cx, name in wl:
-            if 0 <= cx < w:
-                (tw, th), _ = cv2.getTextSize(name, font, scale, 2)
-                pos = (cx - tw // 2, h - 10)
-                cv2.putText(out, name, pos, font, scale, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(out, name, pos, font, scale, (0, 200, 0), 2, cv2.LINE_AA)
+        # Scale: assume labels can stagger across 2 rows, so each label
+        # only needs to fit within ≈ 1.7 × the spacing between every-
+        # other key.
+        white_key_w = w / 36.0
+        target_label_w = 1.5 * white_key_w
+        ref_text = "C#3"
+        (rw, _), _ = cv2.getTextSize(ref_text, font, 1.0, 2)
+        scale = max(0.35, min(0.9, target_label_w / max(1.0, rw)))
+        thick = 1 if scale < 0.5 else 2
+
+        # Stagger: alternate every-other label between two y-rows so
+        # adjacent labels never overlap horizontally.
+        (_, ref_h), _ = cv2.getTextSize(ref_text, font, scale, thick)
+        row_offset = ref_h + 4
+
+        bl_sorted = sorted(bl, key=lambda lab: lab[0])
+        for idx, (cx, name) in enumerate(bl_sorted):
+            (tw, _), _ = cv2.getTextSize(name, font, scale, thick)
+            row = idx % 2
+            y = y_black_bottom - 6 - (row * row_offset)
+            pos = (cx - tw // 2, y)
+            cv2.putText(out, name, pos, font, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
+            cv2.putText(out, name, pos, font, scale, (0, 255, 255), thick, cv2.LINE_AA)
+
+        wl_sorted = sorted(wl, key=lambda lab: lab[0])
+        for idx, (cx, name) in enumerate(wl_sorted):
+            if not (0 <= cx < w):
+                continue
+            (tw, _), _ = cv2.getTextSize(name, font, scale, thick)
+            row = idx % 2
+            y = h - 6 - (row * row_offset)
+            pos = (cx - tw // 2, y)
+            cv2.putText(out, name, pos, font, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
+            cv2.putText(out, name, pos, font, scale, (0, 200, 0), thick, cv2.LINE_AA)
     return out
 
 

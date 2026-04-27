@@ -43,10 +43,18 @@ A static-image keyboard-detection + labeling pipeline lives in `auto_calibrate.p
 
 ### Pipeline overview
 
-1. **Detect 4 loose corners** (`find_corners_auto`) from the white-key blob: isolate whites → horizontal dilate → pick largest wide-aspect contour → RANSAC-fit top/bottom rails → RANSAC-fit left/right rails on the pure-white lower region. Produces a trapezoid that follows perspective on all 4 sides.
+1. **Detect 4 loose corners** (`find_corners_auto`) from the white-key blob (top-down shots): isolate whites → horizontal dilate → pick largest wide-aspect contour → RANSAC-fit top/bottom rails → RANSAC-fit left/right rails on the pure-white lower region. For **side-view shots** where this fails, a manual `<photo>_calib.json` next to the image overrides auto-detection (these calib files are committed per camera mount).
 2. **Tighten the corners to key tops** (`tighten_corners_to_tops`) using the physical piano geometry: black keys are ~0.7× as tall as white keys on the Oxygen 61. Warp with the loose corners, detect where black keys end, compute where white key tops should end via the ratio, inverse-project back to original coords for tight corners.
 3. **Produce two warps** — **loose** (includes key front faces; for future press-detection via front-face motion) and **tight** (just the key tops; for labeling).
-4. **Label the tight warp** (`draw_labels_tight_crop`): dynamically detects the black/white boundary (red line), finds black keys via column-brightness valleys with an **adaptive local threshold** (robust to lighting variation across the warp), draws per-key contours, derives yellow seam positions from detected black-key centers + wide-gap midpoints, and overlays note names (C#2..A#6 for blacks, C2..C7 for whites) assuming a 61-key keyboard with leftmost black = C#2.
+4. **Label the tight warp** (`draw_labels_tight_crop`):
+   - Find `y_black_bottom` (the red line) via Sobel-y horizontal edge.
+   - **Black-key detection** (`_detect_blacks_2d`): 2D Otsu connected-component on the upper band. Each merged blob (multi-key region) is split via **U-valley analysis** on the bottom-y profile of the blob mask, then each inner piece gets the **camera-far outer piece's actual contour** projected onto it as a local template. Z-order clipping resolves overlap between adjacent projected pieces. Falls back to 1D column-projection when 2D fails on top-down shots.
+   - **SWSSW projection** (`_project_to_25`) aligns detected blacks to the canonical 25-key pattern and fills any still-missing positions with translated template polygons.
+   - **Geometric edge guard** trims any polygon that over-extends past the keyboard's playable area (`0.5 * white_key_w` from the left edge, `1.5 * white_key_w` from the right edge — the 61-key C-to-C layout's natural buffer for C2 and B6+C7).
+   - **White-key seams**: Sobel-x peak detection on the white band, with local-median gap-fill (between detected peaks) and edge-extrapolation (past the first/last detected peak). Each seam draws through every row where no black-key polygon covers its column — one unified rule for partial vs full-height.
+   - **Note labels**: hardcoded canonical SWSSW pattern assigns letters; final labels are C#2..A#6 for blacks, C2..C7 for whites. Auto-scaled font size + 2-row stagger keeps labels readable on narrow side-view warps.
+
+The `far_side` parameter on `draw_labels_tight_crop` / `_detect_blacks_2d` selects the camera-far direction (``"right"`` or ``"left"``). The 4-corner detection, geometric edge guard, and seam pipeline are all **camera-agnostic**; only the per-blob template-projection step is camera-side dependent. In a dual-cam rig each camera sets its own `far_side`.
 
 ### Scripts
 - **`key_labeler.py`** — core detection + labeling primitives. Can be run standalone on a single photo (uses `find_keyboard_bbox` for a simple axis-aligned crop): `uv run python key_labeler.py path/to/photo.jpg` → writes `<photo>_labeled.png`.
@@ -56,27 +64,78 @@ A static-image keyboard-detection + labeling pipeline lives in `auto_calibrate.p
 ### Labeler output
 On the tight warped image:
 - **Red horizontal line**: detected black/white boundary (`y_black_bottom`).
-- **Blue polygons**: actual pixel contours of black keys (follow the real key shape including chamfered fronts, not axis-aligned rectangles).
-- **Yellow vertical lines**: white-key seams. Drawn partial-height (below the red line only) through each detected black key's center; drawn full-height at wide-gap midpoints (E|F and B|C positions where no black interrupts).
-- **Note labels**: C#2–A#6 on blacks, C2–C7 on whites (assumes 61-key board with leftmost black = C#2; override `start_octave` in `_label_notes_61key` if different).
+- **Blue polygons**: black-key outlines. Either the actual `cv2.findContours` contour for unmerged blobs, or the camera-far outer piece's contour translated to inner pieces of merged blobs (with overlap resolved by Z-order: closer key wins).
+- **Yellow vertical lines**: white-key seams. Drawn through every row of each seam's column where no black-key polygon covers that row — single unified rule, so seams go full-height in E|F / B|C gaps and clip above any black-key body otherwise.
+- **Note labels**: C#2–A#6 on blacks, C2–C7 on whites (assumes 61-key board with leftmost black = C#2; override `start_octave` in `_label_notes_61key` if different). Labels stagger across two y-rows so adjacent labels don't overlap on narrow warps.
 
 ### Status
 
-**Works end-to-end** on top-down / front-on shots with the whole keyboard roughly horizontal in frame: `IMG_9064`, `IMG_9065`, `IMG_9066`, `IMG_9072`, `IMG_9073`.
+**Top-down / front-on shots** (`IMG_9064`, `IMG_9065`, `IMG_9066`, `IMG_9072`, `IMG_9073`): auto corner detection + labeling work end-to-end.
 
-**Fails corner detection** on heavily-angled / side-view shots where the keyboard isn't an axis-aligned wide blob: `IMG_9067`, `IMG_9068`, `IMG_9070`, `IMG_9071`. `IMG_9069` is shot from under the keyboard (only stand visible) and isn't usable.
+**Side-view shots** (`live_1776971374`, `live_1776972098`, plus the older `IMG_9067/8/70/71`): auto corner detection currently fails on these, so they use a manual `<photo>_calib.json` next to the image (4-click corners via `manual_calibrate.py`, then committed). The detection pipeline downstream of corners works on the manually-calibrated warps — extreme foreshortening on the camera-far end still produces some imperfect outlines (see "Remaining bugs" below).
 
-### What's next (being worked on)
+`IMG_9069` is shot from under the keyboard (only the stand visible) and isn't usable.
 
-- **Side-view detector**: a separate detection path for angled/tilted keyboards (9067/8/70/71). Direction I'm trying: strict-whiteness filter to drop floor/background + union of keyboard-shaped blobs (so a keyboard split by hand occlusion still recovers) → combined point cloud → `cv2.minAreaRect` for a rotated 4-corner box. Everything downstream stays the same.
+### Per-key region storage (handoff for next dev)
 
-### Ideas under consideration (not committed plans)
+Each calibration run writes a `<photo>_keys.json` next to the input image, containing per-key polygon, label, source/confidence tag, baseline intensity, and a "safe" subregion bbox (pre-shrunk to drop edge pixels and leave a fingertip-occlusion buffer). Schema is documented in `calibration.py`'s module docstring.
 
-These are directions being explored, not decided architecture — listed so the context is in one place:
+**Generate:**
+```
+uv run python auto_calibrate.py path/to/calibration_frame.jpg
+# → writes path/to/calibration_frame_keys.json
+```
 
-- **Dual-camera capture**: two upper-side-angle cams, each seeing the full keyboard, possibly fused at runtime. Whether to split the board into halves vs have each cam attempt the whole thing (with some form of confidence weighting) is still open. Fusion mechanism — simple max-of-confidence, weighted average, or something else — hasn't been designed.
-- **Change detection for note events**: the eventual transcription step would compare per-frame key regions against a baseline to flag presses. Calibration here is intended as the one-time input to that runtime step, but the runtime pipeline itself hasn't been written.
-- **Hand occlusion**: the current detection tries to union keyboard-shaped pieces, which helps with small splits. Whether this is enough on its own or needs camera redundancy (point above) is TBD.
-- **Persisted calibration file** (corners + per-key regions + labels + whatever confidence info): a reasonable next step once there's agreement on format.
+**Load at runtime** (the next dev's starting point — see `calibration.py`):
+```python
+from calibration import Calibration
+rt = Calibration.load("path/to/calibration_frame_keys.json")
+warped = rt.warp(frame_bgr)              # one cv2.warpPerspective
+gray   = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+for key in rt.keys:
+    pixels = gray[key.safe_mask]         # pre-rasterized bool mask
+    # … press-detection logic goes here, using:
+    #     key.note                 ("C#3", "F4", …)
+    #     key.type                 ("black" / "white")
+    #     key.source               ("detected" / "template_projected" /
+    #                               "inferred" / "geometric")
+    #     key.confidence           (0.55..0.95)
+    #     key.baseline_intensity   (mean gray inside safe_bbox at calib)
+```
 
-Nothing here is a commitment — marking these as exploration, not a plan.
+Each `Calibration` pre-rasterizes every key's safe-region polygon to a `np.bool_` mask **once at load time**, so per-frame work for the next dev is just a warp + mean-by-mask per key (~61 keys, a few ms total).
+
+`calibration.py` deliberately stops at storage / segmentation. **Press detection itself isn't implemented here** — that's the next dev's task.
+
+### Jumping-off point for the next dev (press detection)
+
+**Files to read first:**
+- `calibration.py` — JSON schema in docstring; `Calibration.load` + `RuntimeKey` (note, type, source, confidence, baseline_intensity, safe_mask, polygon).
+- `key_labeler.py` — `draw_labels_tight_crop` (whole detection pipeline), `_detect_blacks_2d` (per-blob template projection that gives each key its polygon).
+- `_calib.json` files in `piano_photos/` (warp corners) and `_keys.json` files (per-key regions + baselines) — sample data to develop against.
+
+**Possible directions for change/press detection:**
+
+- **Threshold on intensity delta** in each `safe_mask` vs. `baseline_intensity`. Weight the threshold by `1 / key.confidence` — high-confidence keys can flag presses on smaller deltas. Auto-tune the threshold per camera / lighting from a short calibration video (no-press baseline + every-key-pressed sequence).
+- **Hand / skin masking** before the mean: HSV skin filter (broad first pass: `H ∈ [0, 20], S ∈ [20, 150], V ∈ [70, 255]`) excludes hand pixels per frame. If <50% of a key's safe-mask survives the filter, treat as occluded (reuse last frame's value).
+- **Shadow rejection**: a hand hovering over the keyboard casts a shadow that drops gray-mean across multiple adjacent keys uniformly. Detect by comparing per-key delta to the *local median* of nearby keys' deltas — only flag a press where one key's delta diverges from its neighbours'.
+- **Color over intensity**: black-key press-down doesn't change brightness much; saturation/hue around the front of the key shifts more. Consider per-key color histograms instead of single-channel mean.
+- **Temporal filter**: require press to persist for ≥ N consecutive frames before committing a note-on event. Filters shadow flicker and skin-mask noise.
+- **Per-cam fusion** (dual-cam setup): each camera produces its own `Calibration`. Run press detection on each, then fuse — a note is "pressed" if either cam reports it, weighted by which cam covers it on its near half (where polygons are most accurate).
+
+### Remaining bugs / improvements in the labelling pipeline itself
+
+To clean up before the press-detection work above is reliable:
+
+- **Far-most blob still occasionally has a too-wide outline** when the splitter's per-blob template is itself rectangular (the foreshortened far-most piece has no curve to extract). Fix idea: when the rightmost piece of a merged blob is overly rectangular (rect-fill > some threshold), use the previous blob's far-template as a fallback. Earlier attempts at this misclassified valid keys; needs a *provenance flag* (template-projected vs. own-contour) rather than a rect-fill heuristic.
+- **U-valley detection on flat-bottomed blobs** can miss real key boundaries when adjacent columns share the same `bot_sm` value. Currently relaxed to `<=` on one side of the local-min check (catches plateau left-edges). Could go further — explicit plateau detection — if cases persist.
+- **Edge polygons at the keyboard's left/right** sometimes drift past the playable area. Mitigated by the geometric edge guard (`0.5 / 1.5 × white_key_w`), but very tight or very loose warp calibrations can still slip past it.
+- **`_label_notes_61key` assumes exactly 25 black keys** detected; if `_project_to_25` returns fewer, no labels appear. Should label whatever subset of canonical positions is present.
+- **Polygons over-extending into white-key area** at the bottom of some keys — the blob mask sometimes includes shadow under a key. Per-column dark→light gradient detection (Sobel-y, per column) could clip each polygon's bottom precisely; tried and reverted because it interacted badly with the union-with-blob-mask step.
+- **Note-label cluster on extreme side-views** is mostly fixed by 2-row staggering + auto-scaling, but very narrow warps (< 600px) still cram. Vertical (rotated 90°) labels would fully solve this.
+
+### Wider directions (not committed plans)
+
+- **Dual-camera capture**: two upper-side-angle cams, one each with `far_side="right"` and `far_side="left"`. Each sees the full keyboard; fusion at the press-event level (above) gives near-side-of-each-cam priority.
+- **Hand occlusion**: the current detection tries to union keyboard-shaped pieces, which helps with small splits. Per-cam redundancy in the fusion step compensates further.
+- **Auto-calibration recovery**: today `_calib.json` files are committed per camera mount. A periodic recalibration step (re-detect corners every few minutes if the camera moves) could remove the manual-clicking step long-term.

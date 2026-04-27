@@ -472,6 +472,22 @@ def process_one(path: str):
     tight_corners = tighten_corners_to_tops(img, corners)
     warped_tight = warp_from_corners(img, tight_corners)
     labeled = draw_labels_tight_crop(warped_tight)
+
+    # Save per-key calibration JSON next to the input image. Used by
+    # the runtime ``calibration.Calibration.load`` for change detection.
+    try:
+        from calibration import build_calibration_data, save_calibration
+        calib_data = build_calibration_data(
+            warped_tight,
+            corners_tl_tr_br_bl=tight_corners,
+            far_side="right",
+            camera_id=name,
+        )
+        out_calib_path = Path(path).with_suffix("").as_posix() + "_keys.json"
+        save_calibration(calib_data, out_calib_path)
+    except Exception as e:
+        print(f"{name}: calibration JSON save failed ({e})")
+
     return name, vis, warped_loose, labeled
 
 
@@ -496,6 +512,7 @@ def _fit_cell(img, label):
 
 def main(paths):
     rows = []
+    full_res_labeled: list[tuple[str, np.ndarray]] = []
     for p in paths:
         name, vis, warped, labeled = process_one(p)
         rows.append(np.hstack([
@@ -503,13 +520,23 @@ def main(paths):
             _fit_cell(warped, f"{name} | warped"),
             _fit_cell(labeled, f"{name} | warped + labels"),
         ]))
+        full_res_labeled.append((name, labeled))
     grid = np.vstack(rows)
     out = Path("auto_calib_result.png")
     cv2.imwrite(str(out), grid)
     print(f"wrote {out.resolve()} — {grid.shape[1]}x{grid.shape[0]}")
+
+    # Save each labeled image at FULL resolution for readable labels.
+    full_res_dir = Path("piano_photos")
+    full_res_paths: list[Path] = []
+    for name, labeled in full_res_labeled:
+        p_out = full_res_dir / f"_{name}_labeled.png"
+        cv2.imwrite(str(p_out), labeled)
+        full_res_paths.append(p_out)
+
     import subprocess, sys as _sys
     if _sys.platform == "darwin":
-        subprocess.Popen(["open", str(out)])
+        subprocess.Popen(["open", str(out), *map(str, full_res_paths)])
 
 
 if __name__ == "__main__":
