@@ -170,12 +170,25 @@ def build_calibration_data(
             "safe_bbox": [int(sx), int(sy), int(sw), int(sh)],
         })
 
-    # White-key regions: strip below y_black_bottom between adjacent
-    # detected seams. Re-derive seams here so the saved white slots
-    # match the labeler's rendering.
+    # White-key seam positions are derived GEOMETRICALLY from the black
+    # centers + canonical SWSSW pattern. This guarantees exactly 37 seam
+    # positions for the 36 white-key regions, with each one in its
+    # correct canonical slot — independent of Sobel-peak count drift.
+    #
+    #   For each black center:                   one seam AT the center
+    #     (= a white-key boundary that has a black sitting on it)
+    #   For each WIDE inter-black gap (W in SWSSW):  one extra seam at
+    #     the gap midpoint (= the E-F or B-C full-height boundary)
+    #   Past the last black:                     one seam at last + 1.5
+    #     × small_gap (the B6-C7 boundary)
+    #   Plus the two outer edges (x = 0, x = w-1)
+    #
+    # Total = 25 + 9 + 1 + 2 = 37 → 36 white regions.  Optional Sobel
+    # snap-to-nearest refines each position to a real visual seam if
+    # within tolerance; otherwise the geometric position is used as-is.
     band_top = y_black_bottom + int(0.15 * (h - y_black_bottom))
     white_band = gray[band_top:h - 2, :] if h - 2 > band_top else gray[band_top:, :]
-    seam_xs: list[int] = []
+    sobel_seams: list[int] = []
     if white_band.size > 0:
         sx_grad = cv2.Sobel(white_band, cv2.CV_32F, 1, 0, ksize=3)
         col_edge = np.abs(sx_grad).sum(axis=0)
@@ -190,41 +203,103 @@ def build_calibration_data(
             if i < em or i > len(sm) - em:
                 continue
             if sm[i] >= thr and sm[i] >= sm[i - 1] and sm[i] >= sm[i + 1]:
-                if seam_xs and i - seam_xs[-1] < min_sep:
-                    if sm[i] > sm[seam_xs[-1]]:
-                        seam_xs[-1] = i
+                if sobel_seams and i - sobel_seams[-1] < min_sep:
+                    if sm[i] > sm[sobel_seams[-1]]:
+                        sobel_seams[-1] = i
                 else:
-                    seam_xs.append(i)
-        seam_xs = [0] + sorted(seam_xs) + [w - 1]
-    else:
-        seam_xs = [0, w - 1]
+                    sobel_seams.append(i)
 
-    wl_by_x = sorted(wl, key=lambda lab: lab[0])
+    if centers:
+        bgaps = np.diff(centers) if len(centers) >= 2 else np.array([0])
+        sg_arr = np.sort(bgaps)
+        small_gap = float(np.median(sg_arr[: max(1, len(sg_arr) // 2)])) if len(bgaps) > 0 else w / 60.0
+
+        canonical_seams: list[int] = []
+        for i, c in enumerate(centers):
+            canonical_seams.append(int(c))
+            if i < len(centers) - 1:
+                gap = centers[i + 1] - c
+                if gap > 1.5 * small_gap:
+                    canonical_seams.append(int((c + centers[i + 1]) // 2))
+        canonical_seams.append(int(round(centers[-1] + 1.5 * small_gap)))
+
+        snap_tol = max(3, int(0.4 * small_gap))
+
+        def _snap(x: int) -> int:
+            best = None
+            best_d = snap_tol + 1
+            for s in sobel_seams:
+                d = abs(s - x)
+                if d < best_d:
+                    best_d, best = d, s
+            return best if best is not None else x
+
+        snapped = [_snap(c) for c in canonical_seams]
+        snapped = [s for s in snapped if 0 < s < w - 1]
+        seam_xs = sorted(set([0] + snapped + [w - 1]))
+    else:
+        seam_xs = sorted(set([0] + sobel_seams + [w - 1]))
+
+    # Pre-rasterize the union of all black-key polygons. Each white
+    # key's region is its full vertical column MINUS this mask, so the
+    # white region only includes pixels that are actually visible
+    # white-key surface (above the red line: the gaps between black
+    # keys; below the red line: the full unobstructed strip).
+    black_mask = np.zeros((h, w), dtype=np.uint8)
+    for k in keys:  # only black keys appended so far
+        if k["type"] != "black":
+            continue
+        poly_arr = np.array(k["polygon"], dtype=np.int32).reshape(-1, 1, 2)
+        cv2.drawContours(black_mask, [poly_arr], -1, 1, thickness=-1)
+
+    # Assign white-key labels SEQUENTIALLY left-to-right (each label
+    # used at most once), not by nearest-neighbor x — nearest-neighbor
+    # produced duplicates when detected-seam centers drifted off the
+    # SWSSW-pattern label positions by even a few pixels.
+    wl_sorted = sorted(wl, key=lambda lab: lab[0])
+    white_label_idx = 0
     for i in range(len(seam_xs) - 1):
         x_lo, x_hi = seam_xs[i], seam_xs[i + 1]
         if x_hi - x_lo < 3:
             continue
-        cx_w = (x_lo + x_hi) // 2
-        if not wl_by_x:
-            note = "?"
+        if white_label_idx < len(wl_sorted):
+            note = wl_sorted[white_label_idx][1]
+            white_label_idx += 1
         else:
-            note = min(wl_by_x, key=lambda lab: abs(lab[0] - cx_w))[1]
-        ry, rh = y_black_bottom + 2, h - 2 - y_black_bottom
-        rw, rx = x_hi - x_lo, x_lo
-        poly = np.array([
-            [[rx, ry]], [[rx + rw, ry]],
-            [[rx + rw, ry + rh]], [[rx, ry + rh]],
-        ], dtype=np.int32)
-        sx = rx + int(0.20 * rw)
-        sy = ry + int(0.10 * rh)
-        sw = max(1, int(0.60 * rw))
-        sh = max(1, int(0.50 * rh))
+            note = "?"
+
+        # Full-height column rectangle, then subtract the black-key
+        # mask: only visible white-key pixels remain. Find the contour
+        # of the resulting region and save that as the polygon.
+        col_mask = np.zeros((h, w), dtype=np.uint8)
+        col_mask[0:h, x_lo:x_hi] = 1
+        white_only = col_mask & (1 - black_mask)
+        cs, _ = cv2.findContours(white_only, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not cs:
+            continue
+        # Take the largest connected component (typically the lower
+        # strip; upper-strip slivers between blacks are dropped if too
+        # tiny but kept if they're substantial).
+        c = max(cs, key=cv2.contourArea)
+        eps = max(0.5, 0.002 * cv2.arcLength(c, True))
+        white_poly = cv2.approxPolyDP(c, eps, True)
+
+        bx_w, by_w, bw_w, bh_w = cv2.boundingRect(white_poly)
+        # Safe bbox: lower strip below the red line, shrunk inward —
+        # unobstructed by black keys, ideal for change detection.
+        safe_y0 = y_black_bottom + 2
+        safe_y1 = h - 2
+        safe_h_total = max(1, safe_y1 - safe_y0)
+        sx = x_lo + int(0.20 * (x_hi - x_lo))
+        sy = safe_y0 + int(0.10 * safe_h_total)
+        sw = max(1, int(0.60 * (x_hi - x_lo)))
+        sh = max(1, int(0.50 * safe_h_total))
         baseline = float(gray[sy:sy + sh, sx:sx + sw].mean()) if sh > 0 and sw > 0 else 0.0
         keys.append({
             "note": note,
             "type": "white",
-            "polygon": [[int(p[0][0]), int(p[0][1])] for p in poly],
-            "bbox": [int(rx), int(ry), int(rw), int(rh)],
+            "polygon": [[int(p[0][0]), int(p[0][1])] for p in white_poly],
+            "bbox": [int(bx_w), int(by_w), int(bw_w), int(bh_w)],
             "source": "geometric",
             "confidence": SOURCE_CONFIDENCE["geometric"],
             "baseline_intensity": baseline,
