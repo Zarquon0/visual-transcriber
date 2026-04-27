@@ -206,7 +206,465 @@ def _label_notes_61key(
 
 # ── Labeler on a tight warp ──────────────────────────────────────────────────
 
-def draw_labels_tight_crop(warped: np.ndarray, label_notes: bool = True) -> np.ndarray:
+# ── Black-key detection helpers ─────────────────────────────────────────────
+
+def _split_blob_by_xclip(
+    contour: np.ndarray, x0: int, y0: int, bw: int, bh: int,
+    n_keys: int, target_w: float, far_side: str = "right",
+) -> list[tuple[tuple[int, int, int, int], np.ndarray]] | None:
+    """Split a merged-blob into n_keys pieces.
+      - BOTH outer pieces (leftmost and rightmost in the blob) keep
+        their *actual* contours via x-clip — each has one CORRECT outer
+        edge (the blob's left or right boundary, which is the actual
+        keyboard's left/right key edge there, not artificial).
+      - MIDDLE pieces have artificial U-valley boundaries on both sides,
+        so we replace them with a copy of the camera-FAR outer piece's
+        contour translated to their U-valley center.
+
+    far_side: which side of the blob is the camera-far side ('right' or
+    'left'). Used only to pick which outer piece's shape to project onto
+    middle pieces. Won't overwrite either outer piece's own contour.
+    """
+    if n_keys < 2:
+        return None
+    local = np.zeros((bh, bw), dtype=np.uint8)
+    cv2.drawContours(
+        local, [contour - np.array([[[x0, y0]]], dtype=np.int32)],
+        -1, 1, thickness=-1,
+    )
+    bottom_y = np.full(bw, bh, dtype=np.float32)
+    for x in range(bw):
+        col_nz = np.nonzero(local[:, x])[0]
+        if len(col_nz) > 0:
+            bottom_y[x] = float(col_nz.max())
+    k_s = max(3, bw // 30)
+    if k_s % 2 == 0:
+        k_s += 1
+    bot_sm = np.convolve(bottom_y, np.ones(k_s) / k_s, mode="same")
+    candidates = []
+    margin = max(2, bw // 20)
+    for i in range(margin, bw - margin):
+        if bot_sm[i] < bot_sm[i - 1] and bot_sm[i] < bot_sm[i + 1]:
+            candidates.append(i)
+    # Trust the real valleys we find. If fewer than n_keys-1 of them,
+    # adjust the key count downward — better to merge two keys into one
+    # outline than to hallucinate extra keys via synthetic valleys.
+    # (Synthetic-valley splitting tends to over-count when a blob spans
+    # a "wide" white-only gap (E-F or B-C), which adds ~1 key-width of
+    # phantom pixels without any actual key there.)
+    candidates.sort(key=lambda i: bot_sm[i])
+    valleys = sorted(candidates[: n_keys - 1])
+    if len(valleys) < n_keys - 1:
+        n_keys = len(valleys) + 1
+    if n_keys < 2:
+        return None
+    splits = [0] + sorted(valleys) + [bw]
+
+    def _piece_contour(x_lo: int, x_hi: int) -> np.ndarray | None:
+        m = np.zeros_like(local)
+        m[:, x_lo:x_hi] = local[:, x_lo:x_hi]
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not cs:
+            return None
+        return max(cs, key=cv2.contourArea)
+
+    # Outer pieces — clamp width to ≤1.3*target_w to keep extreme edges
+    # sane while still using their own actual contour.
+    max_w = int(round(1.3 * target_w))
+    left_lo, left_hi = splits[0], splits[1]
+    if (left_hi - left_lo) > max_w:
+        left_lo = max(0, left_hi - max_w)
+    right_lo, right_hi = splits[-2], splits[-1]
+    if (right_hi - right_lo) > max_w:
+        right_hi = min(bw, right_lo + max_w)
+    left_c = _piece_contour(left_lo, left_hi)
+    right_c = _piece_contour(right_lo, right_hi)
+    if left_c is None or right_c is None:
+        return None
+    # Far-outer's contour is the ONLY complete contour we have — it's
+    # the only key in the blob whose body wasn't cut short where it
+    # overlaps with a neighbour at the bottom. Every other piece in the
+    # blob has an incomplete bottom (gets cropped by the U-valley to
+    # the next key on the far side). So we project the far-outer's
+    # *full* shape onto every other piece, anchored at that piece's
+    # bottom-near-corner (the U-valley on the side AWAY from far_side).
+    #
+    # No clipping — each polygon is meant to represent a *complete*
+    # key body, so adjacent polygons may overlap in pixel space. That's
+    # fine; the regions still each correspond to one logical key.
+    if far_side == "right":
+        template_c = right_c
+        # Anchor = template's MIN x (its left U-valley = bottom-near-corner
+        # on the far-side template).
+        template_anchor_local = float(template_c[:, 0, 0].min())
+    else:
+        template_c = left_c
+        template_anchor_local = float(template_c[:, 0, 0].max())
+
+    # Build each piece's full template-projected polygon first.
+    raw_polys: list[np.ndarray] = []
+    for k in range(n_keys):
+        if far_side == "right" and k == n_keys - 1:
+            piece_local = template_c
+        elif far_side == "left" and k == 0:
+            piece_local = template_c
+        else:
+            if far_side == "right":
+                target = float(splits[k])
+            else:
+                target = float(splits[k + 1])
+            shift = int(round(target - template_anchor_local))
+            piece_local = template_c + np.array([[[shift, 0]]], dtype=np.int32)
+        raw_polys.append(piece_local)
+
+    # Z-order clip: pieces overlap because each was drawn with the full
+    # far-outer template. The CLOSER key (camera-near side) takes
+    # priority — its full outline shows, and the next-farther key's
+    # near-side gets occluded. Process from close→far, accumulating an
+    # occluder mask; each subsequent piece's polygon is clipped by it.
+    if far_side == "right":
+        order = list(range(n_keys))  # 0 = closest (leftmost)
+    else:
+        order = list(range(n_keys - 1, -1, -1))  # n-1 = closest (rightmost)
+
+    occluder = np.zeros((bh, bw), dtype=np.uint8)
+    clipped: list[np.ndarray | None] = [None] * n_keys
+    for rank, k in enumerate(order):
+        pm = np.zeros((bh, bw), dtype=np.uint8)
+        cv2.drawContours(pm, [raw_polys[k]], -1, 1, thickness=-1)
+        # UNION with the actual blob mask within this piece's x-range:
+        # the template defines the *shape* but any visibly-black pixel
+        # inside the piece's x-range must be inside the polygon. Without
+        # this, the template (extracted from the narrowest far-most key)
+        # leaves out real black-key pixels in wider closer pieces.
+        x_lo, x_hi = splits[k], splits[k + 1]
+        x_range_mask = np.zeros((bh, bw), dtype=np.uint8)
+        x_range_mask[:, x_lo:x_hi] = 1
+        pm = pm | (local & x_range_mask)
+        if rank > 0:
+            pm[occluder > 0] = 0
+        cs2, _ = cv2.findContours(pm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if cs2:
+            clipped[k] = max(cs2, key=cv2.contourArea)
+        else:
+            clipped[k] = raw_polys[k]
+        cv2.drawContours(occluder, [clipped[k]], -1, 1, thickness=-1)
+
+    out: list[tuple[tuple[int, int, int, int], np.ndarray]] = []
+    for k in range(n_keys):
+        piece_img = clipped[k] + np.array([[[x0, y0]]], dtype=np.int32)
+        bx_, by_, bw_t, bh_t = cv2.boundingRect(piece_img)
+        out.append(((bx_, by_, bw_t, bh_t), piece_img))
+    return out if len(out) >= 2 else None
+
+
+def _detect_blacks_2d(
+    gray: np.ndarray, y_black_bottom: int, w: int,
+    far_side: str = "right",
+) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
+    """Direct 2D Otsu connected-component detection of black keys in the
+    upper band. Oversized merged blobs (multiple adjacent keys connected
+    via shadow / anti-aliasing) get SPLIT into individual keys at the
+    U-valleys of the blob's bottom contour. ``far_side`` ('right' or
+    'left') tells the splitter which outer-piece's contour to use as the
+    template for inner pieces — set this to the direction *away* from
+    the camera (e.g. left-mounted cam → far_side='right'). Returns
+    (rects, polys) sorted left-to-right.
+    """
+    upper = gray[:y_black_bottom, :]
+    expected_bk = w / 60
+    blur = cv2.GaussianBlur(upper, (3, 3), 0)
+    _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # MORPH_OPEN removes pixel-level noise. We deliberately SKIP MORPH_CLOSE
+    # so thin white slivers between adjacent keys stay visible — Otsu's
+    # natural separation does most of the splitting work for us.
+    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    # First pass: collect all blobs that are tall enough to be keys, but
+    # without rejecting wide ones (we'll split them after).
+    raw: list[tuple[int, int, int, int, np.ndarray]] = []
+    for c in contours:
+        x_, y_, bw_, bh_ = cv2.boundingRect(c)
+        if bh_ < 0.4 * y_black_bottom:
+            continue
+        if bw_ < max(3, int(0.2 * expected_bk)):
+            continue
+        if bw_ > 0.6 * w:
+            continue  # whole-band over-segment, drop
+        raw.append((x_, y_, bw_, bh_, c))
+    if not raw:
+        return [], []
+    # Estimate true single-key width. On side-view warps most blobs are
+    # merged (2-3 keys), so simple median is biased high. Use the fact
+    # that observed widths follow w_obs = N * w_single (N = 1, 2, 3, …):
+    # score each candidate width by how many other widths are close to
+    # an integer multiple of it. Constrain the candidate to a plausible
+    # range around the geometric expectation (w/60).
+    raw_widths = [r[2] for r in raw if r[2] > w / 200]
+    median_w = float(expected_bk)
+    if raw_widths:
+        cand_lo = 0.5 * expected_bk
+        cand_hi = 2.5 * expected_bk
+        candidates = sorted({rw for rw in raw_widths if cand_lo <= rw <= cand_hi})
+        if not candidates:
+            # Fallback: take the smallest blobs (likely singles).
+            candidates = sorted(set(raw_widths))[: max(1, len(raw_widths) // 4)]
+        best_score, best_w = -1.0, float(np.median(candidates))
+        for c in candidates:
+            score = 0.0
+            for ow in raw_widths:
+                ratio = ow / c
+                n = max(1, int(round(ratio)))
+                # Within 20% of an integer multiple → counts as a fit.
+                if abs(ratio - n) / n < 0.20:
+                    score += 1.0
+            if c < 0.7 * expected_bk:
+                score -= 0.5 * len(raw_widths)  # penalize over-small candidates
+            if score > best_score:
+                best_score, best_w = score, c
+        median_w = float(best_w)
+    # Estimate expected aspect-ratio (h/w) of a single key from the
+    # blobs that are clearly single (width ≈ median_w). Used by the
+    # per-blob splitter to pick the best outer piece as local template.
+    expected_aspect = float(y_black_bottom) / max(1.0, median_w)
+
+    # Split oversized blobs: width > 1.3 * median_w → likely 2+ merged
+    # keys. Use a *per-blob local template*: the outermost piece on the
+    # camera-far side has a clean outer edge (the blob boundary IS the
+    # actual key edge there). We pick whichever outer piece (left or
+    # right) has the more key-like aspect ratio, then translate that
+    # piece's polygon to each inner piece's center. Inner-key polygons
+    # thus get the local-region's actual perspective shape, not a global
+    # template that may have wrong distortion.
+    rects, polys = [], []
+    for x_, y_, bw_, bh_, contour in raw:
+        if bw_ <= 1.3 * median_w:
+            rects.append((x_, y_, bw_, bh_))
+            eps = max(0.5, 0.002 * cv2.arcLength(contour, True))
+            polys.append(cv2.approxPolyDP(contour, eps, True))
+            continue
+        n_keys = max(2, int(round(bw_ / median_w)))
+        split = _split_blob_by_xclip(
+            contour, x_, y_, bw_, bh_, n_keys, median_w, far_side,
+        )
+        if split is not None:
+            for sub_rect, sub_poly in split:
+                rects.append(sub_rect)
+                eps = max(0.5, 0.002 * cv2.arcLength(sub_poly, True))
+                polys.append(cv2.approxPolyDP(sub_poly, eps, True))
+        else:
+            # No usable U-valleys / template: even-spaced rect fallback.
+            piece_w = bw_ / n_keys
+            for k in range(n_keys):
+                px = int(x_ + k * piece_w)
+                pw = int(piece_w)
+                rects.append((px, y_, pw, bh_))
+                polys.append(np.array([
+                    [[px, y_]], [[px + pw, y_]],
+                    [[px + pw, y_ + bh_]], [[px, y_ + bh_]],
+                ], dtype=np.int32))
+    order = sorted(range(len(rects)), key=lambda k: rects[k][0])
+    return [rects[k] for k in order], [polys[k] for k in order]
+
+
+def _detect_blacks_1d(
+    gray: np.ndarray, y_black_bottom: int, w: int,
+) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray | None]]:
+    """1D column-projection fallback for black-key detection. Used when 2D
+    Otsu can't find the bimodal split (typically top-down warps where the
+    upper band is dominated by black-key pixels).
+    """
+    upper = gray[:y_black_bottom, :]
+    mid_top = int(0.2 * y_black_bottom)
+    mid_bot = int(0.8 * y_black_bottom)
+    strip = upper[mid_top:mid_bot, :]
+    col_mean = strip.mean(axis=0)
+    ksz = max(5, int(w / 180))
+    if ksz % 2 == 0:
+        ksz += 1
+    sm = np.convolve(col_mean, np.ones(ksz) / ksz, mode="same")
+    win_size = max(51, int(w * 0.15))
+    if win_size % 2 == 0:
+        win_size += 1
+    half = win_size // 2
+    padded = np.concatenate([sm[half:0:-1], sm, sm[-2:-half - 2:-1]])
+    local_mean = np.convolve(padded, np.ones(win_size) / win_size, mode="valid")
+    dark_thr_arr = local_mean * 0.65
+    med = float(np.median(sm))
+    p10 = float(np.percentile(sm, 10))
+    global_floor = p10 + 0.8 * (med - p10)
+    dark_thr_arr = np.minimum(dark_thr_arr, global_floor)
+    dark_thr = float(np.mean(dark_thr_arr))
+    dark = sm <= dark_thr_arr
+    n = len(dark)
+    gap_merge = max(2, int(0.1 * (w / 36)))
+    i = 0
+    while i < n:
+        if not dark[i]:
+            j = i
+            while j < n and not dark[j]:
+                j += 1
+            if (j - i) <= gap_merge and i > 0 and j < n:
+                dark[i:j] = True
+            i = j
+        else:
+            i += 1
+    expected_bk = w / 60
+    min_w = max(3, int(0.35 * expected_bk))
+    max_w = max(min_w + 1, int(1.6 * expected_bk))
+    row_dark_thr = dark_thr + 0.3 * (med - dark_thr)
+    extent_thr = dark_thr + 0.7 * (med - dark_thr)
+    black_rects: list[tuple[int, int, int, int]] = []
+    black_polys: list[np.ndarray | None] = []
+    vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
+    i = 0
+    while i < n:
+        if dark[i]:
+            j = i
+            while j < n and dark[j]:
+                j += 1
+            bw = j - i
+            if min_w <= bw <= max_w:
+                left = i
+                while left > 0 and sm[left - 1] <= extent_thr and (i - left) < bw:
+                    left -= 1
+                right = j - 1
+                while right < len(sm) - 1 and sm[right + 1] <= extent_thr and (right - (j - 1)) < bw:
+                    right += 1
+                x0_k = max(0, left)
+                x1_k = min(w, right + 1)
+                strip_img = upper[:, x0_k:x1_k]
+                dark_mask = (strip_img <= row_dark_thr).astype(np.uint8) * 255
+                dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, vkernel)
+                cc, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                poly = None
+                if cc:
+                    biggest = max(cc, key=cv2.contourArea)
+                    if cv2.contourArea(biggest) >= 0.2 * bw * y_black_bottom:
+                        eps = max(0.5, 0.002 * cv2.arcLength(biggest, True))
+                        approx = cv2.approxPolyDP(biggest, eps, True)
+                        poly = approx + np.array([[[x0_k, 0]]], dtype=np.int32)
+                black_polys.append(poly)
+                black_rects.append((i, 0, bw, y_black_bottom))
+            i = j
+        else:
+            i += 1
+    return black_rects, black_polys
+
+
+def _classify_gaps_local(gaps: np.ndarray, window: int = 4, ratio: float = 1.4) -> str:
+    """Per-gap S/W classification: gap > ratio × local-median (excluding self) → W."""
+    out = []
+    for i in range(len(gaps)):
+        lo, hi = max(0, i - window), min(len(gaps), i + window + 1)
+        nbrs = np.array([gaps[k] for k in range(lo, hi) if k != i])
+        local = float(np.median(nbrs)) if len(nbrs) else float(gaps[i])
+        out.append("W" if gaps[i] > ratio * local else "S")
+    return "".join(out)
+
+
+def _project_to_25(
+    rects: list[tuple[int, int, int, int]],
+    polys: list[np.ndarray | None],
+    w: int,
+    y_black_bottom: int,
+) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray | None], list[str]]:
+    """Use SWSSW alignment to fill in missing black keys. Returns the full
+    25-key list with each tagged 'detected' or 'inferred'. Inferred keys
+    get template polygons translated from the nearest detected anchor.
+    """
+    n = len(rects)
+    sources = ["detected"] * n
+    if n < 4:
+        return list(rects), list(polys), sources
+    centers = [r[0] + r[2] // 2 for r in rects]
+    widths = [r[2] for r in rects]
+    gaps = np.diff(centers)
+    gap_classes = _classify_gaps_local(gaps)
+    canonical = ("SWSSW" * 5)[:24]
+    # Truncate observed if longer than canonical (rare: spurious extra blob).
+    cmp_obs = gap_classes[: len(canonical)]
+    best_off, best_sc = 0, -1
+    span = max(1, len(canonical) - len(cmp_obs) + 1)
+    for off in range(span):
+        sc = sum(
+            1 for k, c in enumerate(cmp_obs)
+            if (off + k) < len(canonical) and canonical[off + k] == c
+        )
+        if sc > best_sc:
+            best_sc, best_off = sc, off
+    canonical_idx = [best_off + k for k in range(n)]
+    s_gaps = [int(g) for g, c in zip(gaps, gap_classes) if c == "S"]
+    s_unit = float(np.median(s_gaps)) if s_gaps else float(w / 36.0)
+    out_rects, out_polys, out_sources = list(rects), list(polys), list(sources)
+    assigned = set(canonical_idx)
+    for ci in range(25):
+        if ci in assigned:
+            continue
+        left = right = None
+        for k, dci in enumerate(canonical_idx):
+            if dci < ci and (left is None or dci > left[0]):
+                left = (dci, centers[k], widths[k], rects[k], polys[k])
+            if dci > ci and (right is None or dci < right[0]):
+                right = (dci, centers[k], widths[k], rects[k], polys[k])
+        if left is None and right is None:
+            continue
+        if left is None:
+            rci, rx, rw_, rrect, rp = right
+            x_inf = rx - (rci - ci) * s_unit
+            wid_inf = rw_
+            template_poly, template_rect = rp, rrect
+        elif right is None:
+            lci, lx, lw_, lrect, lp = left
+            x_inf = lx + (ci - lci) * s_unit
+            wid_inf = lw_
+            template_poly, template_rect = lp, lrect
+        else:
+            lci, lx, lw_, lrect, lp = left
+            rci, rx, rw_, rrect, rp = right
+            t = (ci - lci) / (rci - lci)
+            x_inf = lx + t * (rx - lx)
+            wid_inf = lw_ + t * (rw_ - lw_)
+            if (ci - lci) <= (rci - ci):
+                template_poly, template_rect = lp, lrect
+            else:
+                template_poly, template_rect = rp, rrect
+        wid_inf = max(4, int(wid_inf))
+        x_left_ = max(0, int(x_inf - wid_inf / 2))
+        x_right_ = min(w, int(x_inf + wid_inf / 2))
+        if x_right_ <= x_left_:
+            continue
+        # Don't extrapolate past the detected-key span: only allow inferred
+        # keys within [leftmost_detected - s_unit, rightmost_detected + s_unit].
+        # Prevents hallucinated keys past the keyboard's actual end.
+        first_detected_x = centers[0] - s_unit
+        last_detected_x = centers[-1] + s_unit
+        if x_inf < first_detected_x or x_inf > last_detected_x:
+            continue
+        if template_poly is not None:
+            tx_, _, tbw_, _ = template_rect
+            tcx_ = tx_ + tbw_ / 2
+            shift = int(round(x_inf - tcx_))
+            inferred_poly = template_poly + np.array([[[shift, 0]]], dtype=np.int32)
+        else:
+            inferred_poly = None
+        out_rects.append((x_left_, 0, x_right_ - x_left_, y_black_bottom))
+        out_polys.append(inferred_poly)
+        out_sources.append("inferred")
+    order = sorted(range(len(out_rects)), key=lambda k: out_rects[k][0])
+    return (
+        [out_rects[k] for k in order],
+        [out_polys[k] for k in order],
+        [out_sources[k] for k in order],
+    )
+
+
+# ── Labeler on a tight warp ──────────────────────────────────────────────────
+
+def draw_labels_tight_crop(
+    warped: np.ndarray, label_notes: bool = True, far_side: str = "right",
+) -> np.ndarray:
     """Annotate a tight-keyboard-crop warped image with detected key features.
 
     Assumes the warped image height IS the keyboard (no body above, no floor
@@ -237,107 +695,19 @@ def draw_labels_tight_crop(warped: np.ndarray, label_notes: bool = True) -> np.n
     if y_black_bottom < int(0.3 * h):
         y_black_bottom = int(0.55 * h)
 
-    # --- Black keys via column-brightness valleys in the upper band ---
-    upper = gray[:y_black_bottom, :]
-    mid_top = int(0.2 * y_black_bottom)
-    mid_bot = int(0.8 * y_black_bottom)
-    strip = upper[mid_top:mid_bot, :]
-    col_mean = strip.mean(axis=0)
-    # Smooth ~1/3 of a black-key width.
-    ksz = max(5, int(w / 180))
-    if ksz % 2 == 0:
-        ksz += 1
-    sm = np.convolve(col_mean, np.ones(ksz) / ksz, mode="same")
-    # Adaptive (local) threshold: a column is "dark" if it's meaningfully
-    # below the average brightness of its neighborhood — works across
-    # lighting gradients in the warp. Window is ~3-4 key widths wide so the
-    # local mean reflects the local white-surface brightness, not local keys.
-    win_size = max(51, int(w * 0.15))
-    if win_size % 2 == 0:
-        win_size += 1
-    # Reflect-pad so local_mean stays accurate near edges (convolve's default
-    # zero-padding biases the edge columns' local mean downward, causing the
-    # first/last keys to be missed).
-    half = win_size // 2
-    padded = np.concatenate([sm[half:0:-1], sm, sm[-2:-half - 2:-1]])
-    local_mean = np.convolve(padded, np.ones(win_size) / win_size, mode="valid")
-    dark_thr_arr = local_mean * 0.65
-    # Global floor so purely-noisy bright warps can't produce phantom dark
-    # columns: require sm to also be below 80% of the way from p10 to median.
-    med = float(np.median(sm))
-    p10 = float(np.percentile(sm, 10))
-    global_floor = p10 + 0.8 * (med - p10)
-    dark_thr_arr = np.minimum(dark_thr_arr, global_floor)
-    dark_thr = float(np.mean(dark_thr_arr))  # kept for downstream reuse
-    dark = sm <= dark_thr_arr
-    n = len(dark)
+    # --- Black-key detection: 2D primary, 1D fallback, then SWSSW projection ---
+    rects_2d, polys_2d = _detect_blacks_2d(gray, y_black_bottom, w, far_side)
+    if len(rects_2d) >= 8:
+        black_rects = rects_2d
+        black_polys: list[np.ndarray | None] = list(polys_2d)
+    else:
+        black_rects, black_polys = _detect_blacks_1d(gray, y_black_bottom, w)
 
-    # Merge tiny gaps so a single key's dark region with micro-noise doesn't
-    # fragment. Gap must be < ~10% of white-key-width.
-    gap_merge = max(2, int(0.1 * (w / 36)))
-    i = 0
-    while i < n:
-        if not dark[i]:
-            j = i
-            while j < n and not dark[j]:
-                j += 1
-            if (j - i) <= gap_merge and i > 0 and j < n:
-                dark[i:j] = True
-            i = j
-        else:
-            i += 1
-
-    # Each contiguous dark run = one black key. This naturally handles
-    # adjacent keys (separated by a bright "white-between-blacks" run) as
-    # distinct keys, avoiding the min-sep collapse of the local-minima
-    # approach.
-    expected_bk = w / 60
-    min_w = max(3, int(0.35 * expected_bk))
-    max_w = max(min_w + 1, int(1.6 * expected_bk))
-    row_dark_thr = dark_thr + 0.3 * (med - dark_thr)
-    # Looser threshold used to EXPAND the x-extent outward so anti-aliased
-    # key-edge pixels are included in the contour even when they aren't
-    # dark enough to form the initial run.
-    extent_thr = dark_thr + 0.7 * (med - dark_thr)
-    black_rects: list[tuple[int, int, int, int]] = []
-    black_polys: list[np.ndarray | None] = []
-    vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
-    i = 0
-    while i < n:
-        if dark[i]:
-            j = i
-            while j < n and dark[j]:
-                j += 1
-            bw = j - i
-            if min_w <= bw <= max_w:
-                # Expand outward using extent_thr so anti-aliased key edges
-                # get included. Walk left/right while col-brightness stays
-                # under extent_thr. Stops before hitting a neighboring key's
-                # bright surface.
-                left = i
-                while left > 0 and sm[left - 1] <= extent_thr and (i - left) < bw:
-                    left -= 1
-                right = j - 1
-                while right < len(sm) - 1 and sm[right + 1] <= extent_thr and (right - (j - 1)) < bw:
-                    right += 1
-                x0_k = max(0, left)
-                x1_k = min(w, right + 1)
-                strip_img = upper[:, x0_k:x1_k]
-                dark_mask = (strip_img <= row_dark_thr).astype(np.uint8) * 255
-                dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, vkernel)
-                cc, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                poly = None
-                if cc:
-                    biggest = max(cc, key=cv2.contourArea)
-                    if cv2.contourArea(biggest) >= 0.2 * bw * y_black_bottom:
-                        eps = max(0.5, 0.002 * cv2.arcLength(biggest, True))
-                        approx = cv2.approxPolyDP(biggest, eps, True)
-                        poly = approx + np.array([[[x0_k, 0]]], dtype=np.int32)
-                black_polys.append(poly)
-                black_rects.append((i, 0, bw, y_black_bottom))
-            i = j
-        else:
-            i += 1
+    # Geometric fill-in: align detected to canonical SWSSW pattern, project
+    # missing keys, copy nearest-detected polygon for each inferred key.
+    black_rects, black_polys, black_sources = _project_to_25(
+        black_rects, black_polys, w, y_black_bottom,
+    )
 
     black_contours: list[np.ndarray] = []
     for poly, rect in zip(black_polys, black_rects):
@@ -350,62 +720,131 @@ def draw_labels_tight_crop(warped: np.ndarray, label_notes: bool = True) -> np.n
                 dtype=np.int32,
             ))
 
-    # --- White-key seams via column-brightness valleys in the pure-white
-    # region (vision-based, analogous to how we detect black keys).
-    # Seams are DARK vertical lines between adjacent white keys — narrower
-    # but darker than the surrounding bright key surfaces. Local minima in
-    # per-column mean brightness, below the median minus a margin.
+    # --- White-key seams: independent column-brightness valley detection.
+    # Seams are dark vertical valleys between bright white-key surfaces,
+    # detected directly from the white band — no dependency on the black
+    # key list for *position*. Black-key centers are used afterward only
+    # to classify each detected seam as partial (a black sits above it)
+    # vs full-height (E|F or B|C, no black above).
     band_top = y_black_bottom + int(0.15 * (h - y_black_bottom))
     band_bot = h - 2
-    white_band = gray[band_top:band_bot, :]
-    col_mean_wh = white_band.mean(axis=0)
-    # Smooth lightly to kill pixel-noise minima.
-    k_wh = max(3, int(w / 500))
-    if k_wh % 2 == 0:
-        k_wh += 1
-    sm_wh = np.convolve(col_mean_wh, np.ones(k_wh) / k_wh, mode="same")
-    med_wh = float(np.median(sm_wh))
-    p25_wh = float(np.percentile(sm_wh, 25))
-    seam_thr = p25_wh + 0.7 * (med_wh - p25_wh)
-    # Minimum spacing between seams ~ 60% of a typical white-key width,
-    # derived from detected black-key spacing (black spacing ≈ white width).
+    white_band = gray[band_top:band_bot, :] if band_bot > band_top else gray[band_top:, :]
+    seam_peaks: list[int] = []
     black_centers_sorted = sorted(int(x + bw2 / 2) for (x, _, bw2, _) in black_rects)
     if len(black_centers_sorted) >= 2:
-        gaps = np.diff(black_centers_sorted)
-        sorted_gaps = np.sort(gaps)
-        small_gap = float(np.median(sorted_gaps[: max(1, len(sorted_gaps) // 2)]))
+        gaps_b = np.diff(black_centers_sorted)
+        sorted_gaps_b = np.sort(gaps_b)
+        small_gap = float(np.median(sorted_gaps_b[: max(1, len(sorted_gaps_b) // 2)]))
     else:
         small_gap = w / 36.0
-    min_sep = max(4, int(0.6 * small_gap))
-    seam_peaks: list[int] = []
-    for i in range(1, len(sm_wh) - 1):
-        if sm_wh[i] <= seam_thr and sm_wh[i] <= sm_wh[i - 1] and sm_wh[i] <= sm_wh[i + 1]:
-            if seam_peaks and i - seam_peaks[-1] < min_sep:
-                if sm_wh[i] < sm_wh[seam_peaks[-1]]:
-                    seam_peaks[-1] = i
-            else:
-                seam_peaks.append(i)
+    if white_band.size > 0:
+        # Sobel-x highlights vertical-edge transitions — seams are exactly
+        # vertical dark lines between bright key surfaces. Sum |∂I/∂x| down
+        # each column gives a strong peak at every seam, even when the
+        # seam itself is only marginally darker than the white surface
+        # (low-contrast side-view warps where pure column-mean valleys
+        # collapse into the noise floor).
+        sx = cv2.Sobel(white_band, cv2.CV_32F, 1, 0, ksize=3)
+        col_edge = np.abs(sx).sum(axis=0)
+        k_wh = max(3, int(w / 500))
+        if k_wh % 2 == 0:
+            k_wh += 1
+        sm_wh = np.convolve(col_edge, np.ones(k_wh) / k_wh, mode="same")
+        seam_thr = float(np.percentile(sm_wh, 70))
+        min_sep = max(4, int(w / 80))
+        edge_margin = max(6, int(w / 200))
+        for i in range(1, len(sm_wh) - 1):
+            if i < edge_margin or i > len(sm_wh) - edge_margin:
+                continue
+            if sm_wh[i] >= seam_thr and sm_wh[i] >= sm_wh[i - 1] and sm_wh[i] >= sm_wh[i + 1]:
+                if seam_peaks and i - seam_peaks[-1] < min_sep:
+                    if sm_wh[i] > sm_wh[seam_peaks[-1]]:
+                        seam_peaks[-1] = i
+                else:
+                    seam_peaks.append(i)
 
-    # Classify each detected seam as partial (aligned with a black key above)
-    # or full-height (no black above — E|F / B|C gap). Tolerance is a
-    # fraction of the measured unit spacing so slight detection-center
-    # offsets from true seam don't misclassify.
-    tolerance = max(8, int(0.35 * small_gap))
-    seam_white_only: list[int] = []
-    seam_full: list[int] = []
-    for bx in seam_peaks:
-        aligned_with_black = any(abs(bx - cx) <= tolerance
-                                 for cx in black_centers_sorted)
-        (seam_white_only if aligned_with_black else seam_full).append(bx)
+    # Geometric gap-fill: where two adjacent detected seams are spaced much
+    # wider than the *local* median seam-spacing (window ±3), insert
+    # evenly-spaced fill seams. Local median tracks the perspective-induced
+    # spacing drift across the warp on side-view shots.
+    if len(seam_peaks) >= 4:
+        seam_gaps = np.diff(seam_peaks)
+        filled: list[int] = [seam_peaks[0]]
+        for k in range(len(seam_gaps)):
+            lo, hi = max(0, k - 3), min(len(seam_gaps), k + 4)
+            local_med = float(np.median([seam_gaps[j] for j in range(lo, hi) if j != k]))
+            g = seam_gaps[k]
+            n_fill = int(round(g / local_med)) - 1
+            if n_fill >= 1 and g > 1.4 * local_med:
+                step = g / (n_fill + 1)
+                for j in range(1, n_fill + 1):
+                    filled.append(int(round(seam_peaks[k] + j * step)))
+            filled.append(seam_peaks[k + 1])
+        seam_peaks = sorted(set(filled))
+
+        # Edge extrapolation: extend past the leftmost / rightmost detected
+        # seam using the LOCAL spacing at that end. Side-view warps lose
+        # Sobel signal toward the foreshortened end (right side of `74`),
+        # leaving the far end un-seamed. Stepping out by the local-end
+        # median fills that span. We stretch the step slightly each
+        # iteration to accommodate the shrinking-toward-far-end perspective
+        # (or equivalently, the farther we get from detected anchors, the
+        # less confidence in the exact spacing).
+        if len(seam_peaks) >= 4:
+            gaps_now = np.diff(seam_peaks)
+            edge_n = max(3, len(gaps_now) // 5)
+            left_step = float(np.median(gaps_now[:edge_n]))
+            right_step = float(np.median(gaps_now[-edge_n:]))
+            extended: list[int] = list(seam_peaks)
+            x_l, step_l = seam_peaks[0] - left_step, left_step
+            i = 0
+            while x_l > 2 and i < 8:
+                extended.append(int(round(x_l)))
+                step_l *= 1.05
+                x_l -= step_l
+                i += 1
+            x_r, step_r = seam_peaks[-1] + right_step, right_step
+            i = 0
+            while x_r < w - 3 and i < 8:
+                extended.append(int(round(x_r)))
+                step_r *= 1.05
+                x_r += step_r
+                i += 1
+            seam_peaks = sorted(set(extended))
+
+    # Build a polygon mask of all black-key shapes — the ground-truth
+    # representation of where black keys actually are. Filled, so the
+    # mask is True wherever a black-key polygon covers a pixel.
+    black_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(black_mask, black_contours, -1, color=1, thickness=-1)
 
     # --- Draw geometric markers ---
     cv2.line(out, (0, y_black_bottom), (w - 1, y_black_bottom), (0, 0, 255), 2)
-    for bx in seam_white_only:
-        cv2.line(out, (bx, y_black_bottom + 2), (bx, h - 1), (0, 255, 255), 2)
-    for bx in seam_full:
-        cv2.line(out, (bx, 0), (bx, h - 1), (0, 255, 255), 2)
-    if black_contours:
-        cv2.drawContours(out, black_contours, -1, (255, 0, 0), 2)
+    # Each seam is drawn through every row where the polygon mask is empty
+    # at its column — i.e., wherever there's no black key directly above
+    # to obstruct it. Single unified rule: full-height where unobstructed
+    # (E|F, B|C gaps), clipped above the polygon's bottom edge where a
+    # black key sits, and naturally fills the visible white strip between
+    # adjacent keys (the U-valley in a merged blob) above the red line.
+    for bx in seam_peaks:
+        col = black_mask[:, bx]
+        in_run = False
+        y_start = 0
+        for y in range(h):
+            if col[y] == 0 and not in_run:
+                y_start = y
+                in_run = True
+            elif col[y] != 0 and in_run:
+                if y - 1 - y_start >= 2:
+                    cv2.line(out, (bx, y_start), (bx, y - 1), (0, 255, 255), 2)
+                in_run = False
+        if in_run and (h - 1 - y_start) >= 2:
+            cv2.line(out, (bx, y_start), (bx, h - 1), (0, 255, 255), 2)
+    # Detected = solid blue; inferred = solid blue too (so visually all 25
+    # keys look outlined). Internal source flag is preserved for the
+    # calibration JSON's confidence weighting later.
+    for poly, src in zip(black_contours, black_sources):
+        cv2.drawContours(out, [poly], -1, (255, 0, 0), 2)
 
     # --- Note labels (assumes 61-key board, leftmost black = C#2) ---
     if label_notes:
