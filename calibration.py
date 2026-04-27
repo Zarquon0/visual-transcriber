@@ -209,19 +209,19 @@ def build_calibration_data(
                 else:
                     sobel_seams.append(i)
 
-    if centers:
-        bgaps = np.diff(centers) if len(centers) >= 2 else np.array([0])
-        sg_arr = np.sort(bgaps)
-        small_gap = float(np.median(sg_arr[: max(1, len(sg_arr) // 2)])) if len(bgaps) > 0 else w / 60.0
-
-        canonical_seams: list[int] = []
-        for i, c in enumerate(centers):
-            canonical_seams.append(int(c))
-            if i < len(centers) - 1:
-                gap = centers[i + 1] - c
-                if gap > 1.5 * small_gap:
-                    canonical_seams.append(int((c + centers[i + 1]) // 2))
-        canonical_seams.append(int(round(centers[-1] + 1.5 * small_gap)))
+    # Derive white-key boundaries DIRECTLY from the same `wl` label
+    # positions that the labelling output uses. Each adjacent pair of
+    # label x-positions defines a region; the seam between them is the
+    # midpoint. This guarantees the JSON's white-key regions match the
+    # labelling visualisation exactly — they're built from the same
+    # positions. Optionally snap each midpoint to a nearby Sobel peak
+    # for visual accuracy on the actual seam pixels.
+    wl_label_xs = sorted(lab[0] for lab in wl) if wl else []
+    if len(wl_label_xs) >= 2:
+        # small_gap (white-key width estimate) = median pairwise distance
+        # between adjacent label centers.
+        wl_diffs = np.diff(wl_label_xs)
+        small_gap = float(np.median(wl_diffs))
 
         snap_tol = max(3, int(0.4 * small_gap))
 
@@ -234,9 +234,17 @@ def build_calibration_data(
                     best_d, best = d, s
             return best if best is not None else x
 
-        snapped = [_snap(c) for c in canonical_seams]
-        snapped = [s for s in snapped if 0 < s < w - 1]
-        seam_xs = sorted(set([0] + snapped + [w - 1]))
+        # Inner seams: midpoint between adjacent white-key label x's.
+        inner_seams = [
+            _snap((wl_label_xs[i] + wl_label_xs[i + 1]) // 2)
+            for i in range(len(wl_label_xs) - 1)
+        ]
+        # Outer seams: half a white-key-width past the leftmost label
+        # (left edge of leftmost white) and past the rightmost label
+        # (right edge of rightmost white).
+        left_outer = max(0, int(round(wl_label_xs[0] - small_gap / 2)))
+        right_outer = min(w - 1, int(round(wl_label_xs[-1] + small_gap / 2)))
+        seam_xs = sorted(set([left_outer] + inner_seams + [right_outer]))
     else:
         seam_xs = sorted(set([0] + sobel_seams + [w - 1]))
 
