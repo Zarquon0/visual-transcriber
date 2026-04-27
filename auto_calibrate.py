@@ -440,12 +440,23 @@ def warp_from_corners(img: np.ndarray, corners: np.ndarray, out_height: int = 22
 
 def process_one(path: str):
     img = load_image(path)
-    result = find_corners_auto(img, debug=True)
-    corners, smeared, pts, fits = result
     name = Path(path).stem
-    if corners is None:
-        print(f"{name}: FAILED to detect corners")
-        return name, img, None, None
+    # If a matching manual calibration exists alongside the image, use it
+    # instead of auto-detecting. Lets us test downstream labeling on shots
+    # where auto-detection fails (angled / blurry side views).
+    calib_path = Path(path).with_suffix("").as_posix() + "_calib.json"
+    if Path(calib_path).exists():
+        import json
+        with open(calib_path) as f:
+            calib = json.load(f)
+        corners = np.array(calib["corners_tl_tr_br_bl"], dtype=np.float32)
+        print(f"{name}: using saved manual calibration")
+    else:
+        result = find_corners_auto(img, debug=True)
+        corners, smeared, pts, fits = result
+        if corners is None:
+            print(f"{name}: FAILED to detect corners (no manual calib found)")
+            return name, img, None, None
 
     vis = img.copy()
     pts_int = corners.astype(int)
@@ -496,6 +507,9 @@ def main(paths):
     out = Path("auto_calib_result.png")
     cv2.imwrite(str(out), grid)
     print(f"wrote {out.resolve()} — {grid.shape[1]}x{grid.shape[0]}")
+    import subprocess, sys as _sys
+    if _sys.platform == "darwin":
+        subprocess.Popen(["open", str(out)])
 
 
 if __name__ == "__main__":
