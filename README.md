@@ -107,6 +107,13 @@ Each `Calibration` pre-rasterizes every key's safe-region polygon to a `np.bool_
 
 `calibration.py` deliberately stops at storage / segmentation. **Press detection itself isn't implemented here** — that's the next dev's task.
 
+**Validator:** `validate_calibration.py` produces a side-by-side image showing the raw warp vs. each stored key's polygon outline (color-coded by source/confidence) with note labels overlaid, plus a summary footer flagging duplicate / missing labels and baseline-intensity sanity violations. Run it after `auto_calibrate.py` on any `_keys.json` to confirm the storage matches the visible keys:
+
+```
+uv run python validate_calibration.py piano_photos/<photo>_keys.json
+# → writes <photo>_validate.png alongside the input
+```
+
 ### Jumping-off point for the next dev (press detection)
 
 **Files to read first:**
