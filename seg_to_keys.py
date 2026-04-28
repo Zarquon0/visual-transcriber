@@ -27,7 +27,7 @@ N_LINES           = 20       # number of longest lines to accept
 RANSAC_THRESH = 0.2 # minimum percent of input points a ransac line must claim as inliers to be accepted
 
 PARALLEL_TOL = 5 # degrees off the heading of two lines can be to be considered parallel
-CROP_PADDING = 20 # pixels of padding to add to warped crop
+CROP_PADDING = 0 # pixels of padding to add to warped crop
 
 # Debug params
 LINE_COLOR        = (0, 0, 255)   # BGR
@@ -72,6 +72,23 @@ def _draw_hist_debug(smoothed: np.ndarray, peak: int) -> np.ndarray:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1, cv2.LINE_AA)
     return vis
 
+def make_mosaic(named_frames: list[tuple[str, np.ndarray]]) -> np.ndarray:
+    cells = []
+    for label, img in named_frames:
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        cell = cv2.resize(img, (MOSAIC_CELL_W, MOSAIC_CELL_H))
+        cv2.putText(cell, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(cell, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (255, 255, 255), 1, cv2.LINE_AA)
+        cells.append(cell)
+    blank = np.zeros((MOSAIC_CELL_H, MOSAIC_CELL_W, 3), dtype=np.uint8)
+    while len(cells) % MOSAIC_COLS != 0:
+        cells.append(blank)
+    rows = [np.hstack(cells[i:i + MOSAIC_COLS])
+            for i in range(0, len(cells), MOSAIC_COLS)]
+    return np.vstack(rows)
 
 #
 # Geometry Helpers
@@ -113,70 +130,6 @@ def intersect(l_h: tuple[float], l_v: tuple[float]):
 #
 # Main Helpers
 #
-
-def make_mosaic(named_frames: list[tuple[str, np.ndarray]]) -> np.ndarray:
-    cells = []
-    for label, img in named_frames:
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        cell = cv2.resize(img, (MOSAIC_CELL_W, MOSAIC_CELL_H))
-        cv2.putText(cell, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(cell, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (255, 255, 255), 1, cv2.LINE_AA)
-        cells.append(cell)
-    blank = np.zeros((MOSAIC_CELL_H, MOSAIC_CELL_W, 3), dtype=np.uint8)
-    while len(cells) % MOSAIC_COLS != 0:
-        cells.append(blank)
-    rows = [np.hstack(cells[i:i + MOSAIC_COLS])
-            for i in range(0, len(cells), MOSAIC_COLS)]
-    return np.vstack(rows)
-
-
-def warp_key_lines(frame: np.ndarray, line_a: np.ndarray, line_b: np.ndarray, padding: int = CROP_PADDING) -> np.ndarray:
-    """Perspective-warp frame so that line_a and line_b form a rectangle and crop to this (padded) rectangle"""
-    ax1, ay1, ax2, ay2 = line_a.astype(float)
-    bx1, by1, bx2, by2 = line_b.astype(float)
-
-    # Unit vector along line_a
-    dax, day = ax2 - ax1, ay2 - ay1
-    len_a = np.hypot(dax, day)
-    if len_a == 0:
-        return np.zeros((2 * padding, 2 * padding, 3), dtype=np.uint8)
-    ux, uy = dax / len_a, day / len_a
-
-    # Project line_b endpoints onto line_a direction for consistent left/right ordering
-    tb1 = (bx1 - ax1) * ux + (by1 - ay1) * uy
-    tb2 = (bx2 - ax1) * ux + (by2 - ay1) * uy
-    if tb1 <= tb2:
-        b_left, b_right = np.float32([bx1, by1]), np.float32([bx2, by2])
-    else:
-        b_left, b_right = np.float32([bx2, by2]), np.float32([bx1, by1])
-
-    a_left  = np.float32([ax1, ay1])
-    a_right = np.float32([ax2, ay2])
-
-    # Order into TL, TR, BR, BL by which line sits higher (smaller mean y)
-    if (ay1 + ay2) / 2 <= (by1 + by2) / 2:
-        src = np.float32([a_left, a_right, b_right, b_left])
-    else:
-        src = np.float32([b_left, b_right, a_right, a_left])
-
-    # Destination rectangle: width = len_a, height = perp distance between lines
-    mid_bx, mid_by = (bx1 + bx2) / 2, (by1 + by2) / 2
-    h = int(max(1, abs(day * (mid_bx - ax1) - dax * (mid_by - ay1)) / len_a))
-    w = int(len_a)
-
-    dst = np.float32([
-        [padding,         padding    ],
-        [padding + w,     padding    ],
-        [padding + w,     padding + h],
-        [padding,         padding + h],
-    ])
-
-    # Apply perspective warp and return
-    M = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(frame, M, (w + 2 * padding, h + 2 * padding))
 
 def isolate_white(frame: np.ndarray) -> np.ndarray:
     """Return a white-key mask (BGR, white=key, black=background).
@@ -285,23 +238,50 @@ def ransac_line(points: np.ndarray, iters: int = 200, inlier_tol: float = 3.0, r
     m, b = np.linalg.lstsq(A, yin, rcond=None)[0]
     return float(m), float(b), best_inliers
 
-def find_other_rail(first_rail, other_segs: list[np.ndarray]):
-    # Filter out non-parallel segments
-    longest_angle = segment_angle(first_rail)
-    parallel_tol_rad = PARALLEL_TOL * np.pi / 180
-    parallel = [
-        s for s in other_segs
-        if angle_diff(segment_angle(s), longest_angle) <= parallel_tol_rad
-    ]
-    # Find the farthest of away of the parallel segments (by midpoint)
-    if parallel:
-        farthest = max(parallel, key=lambda s: point_to_line_dist(
-            (s[0][0] + s[0][2]) / 2, (s[0][1] + s[0][3]) / 2, first_rail))
-        other_rail = farthest
-    else:
-        other_rail = first_rail # Failure mode! Don't want to error though to end livestream
+def warp_key_lines(frame: np.ndarray, line_a: np.ndarray, line_b: np.ndarray, padding: int = CROP_PADDING) -> np.ndarray:
+    """Perspective-warp frame so that line_a and line_b form a rectangle and crop to this (padded) rectangle"""
+    ax1, ay1, ax2, ay2 = line_a.astype(float)
+    bx1, by1, bx2, by2 = line_b.astype(float)
 
-    return other_rail
+    # Unit vector along line_a
+    dax, day = ax2 - ax1, ay2 - ay1
+    len_a = np.hypot(dax, day)
+    if len_a == 0:
+        return np.zeros((2 * padding, 2 * padding, 3), dtype=np.uint8)
+    ux, uy = dax / len_a, day / len_a
+
+    # Project line_b endpoints onto line_a direction for consistent left/right ordering
+    tb1 = (bx1 - ax1) * ux + (by1 - ay1) * uy
+    tb2 = (bx2 - ax1) * ux + (by2 - ay1) * uy
+    if tb1 <= tb2:
+        b_left, b_right = np.float32([bx1, by1]), np.float32([bx2, by2])
+    else:
+        b_left, b_right = np.float32([bx2, by2]), np.float32([bx1, by1])
+
+    a_left  = np.float32([ax1, ay1])
+    a_right = np.float32([ax2, ay2])
+
+    # Order into TL, TR, BR, BL by which line sits higher (smaller mean y)
+    if (ay1 + ay2) / 2 <= (by1 + by2) / 2:
+        src = np.float32([a_left, a_right, b_right, b_left])
+    else:
+        src = np.float32([b_left, b_right, a_right, a_left])
+
+    # Destination rectangle: width = len_a, height = perp distance between lines
+    mid_bx, mid_by = (bx1 + bx2) / 2, (by1 + by2) / 2
+    h = int(max(1, abs(day * (mid_bx - ax1) - dax * (mid_by - ay1)) / len_a))
+    w = int(len_a)
+
+    dst = np.float32([
+        [padding,         padding    ],
+        [padding + w,     padding    ],
+        [padding + w,     padding + h],
+        [padding,         padding + h],
+    ])
+
+    # Apply perspective warp and return
+    M = cv2.getPerspectiveTransform(src, dst)
+    return M, cv2.warpPerspective(frame, M, (w + 2 * padding, h + 2 * padding))
 
 def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
     """
@@ -380,46 +360,7 @@ def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
 
     first_rail = np.concatenate([corners[0], corners[1]])
     second_rail = np.concatenate([corners[2], corners[3]])
-    warped = warp_key_lines(frame, first_rail, second_rail)
-
-    # # Hough transform (find lines from edges)
-    # _, W = thick_edges.shape
-    # segments = cv2.HoughLinesP(
-    #     thick_edges,
-    #     rho=HOUGH_RHO,
-    #     theta=HOUGH_THETA,
-    #     threshold=int(W * HOUGH_THRES_MULT),
-    #     minLineLength=int(W * HOUGH_ML_MULT),
-    #     maxLineGap=int(W * HOUGH_GAP_MULT),
-    # ) 
-
-    # all_lines = frame.copy()
-    # keys = frame.copy()
-    # warped = np.zeros_like(frame)
-    # if segments is not None and len(segments) > 0:
-    #     # Keep only near-horizontal segments so Hough can't pick vertical
-    #     # key-separator edges as a "rail".
-    #     horiz_tol_rad = 30 * np.pi / 180
-    #     horizontal = [s for s in segments
-    #                   if angle_diff(segment_angle(s), 0.0) <= horiz_tol_rad]
-    #     segments = horizontal if horizontal else list(segments)
-    #     # Isolate keyboard bounding lines
-    #     top_segments = sorted(segments, key=segment_length, reverse=True)[:N_LINES]
-    #     first_rail = top_segments[0]
-    #     other_rail = find_other_rail(first_rail, top_segments[1:])
-    #     # Apply projective warp and crop
-    #     warped = warp_key_lines(frame, first_rail[0], other_rail[0])
-
-    #     if debug:
-    #         # all_lines lines
-    #         for seg in top_segments:
-    #             x1, y1, x2, y2 = seg[0]
-    #             cv2.line(all_lines, (x1, y1), (x2, y2), LINE_COLOR, LINE_THICKNESS)
-    #         # keys lines
-    #         r1x1, r1y1, r1x2, r1y2 = first_rail[0]
-    #         r2x1, r2y1, r2x2, r2y2 = other_rail[0]
-    #         cv2.line(keys, (r1x1, r1y1), (r1x2, r1y2), LINE_COLOR, LINE_THICKNESS)
-    #         cv2.line(keys, (r2x1, r2y1), (r2x2, r2y2), LINE_COLOR2, LINE_THICKNESS)
+    warp_trans, warped = warp_key_lines(frame, first_rail, second_rail)
         
     return frame, threshed, blob, lines_vis, corners_vis, warped if debug else warped
 
@@ -463,7 +404,7 @@ def pics_to_piano(paths: list[str], window_name: str = "keyboard_stream"):
         cv2.waitKey(0)
 
 if __name__ == "__main__":
-    streams = open_canon_streams(silent=False)
+    streams = open_canon_streams(allow_iphone=True, silent=False)
     for stream in streams:
         stream_to_piano(stream)
         
