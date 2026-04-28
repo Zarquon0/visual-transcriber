@@ -26,8 +26,9 @@ To change the image resolution or FPS (maybe - not sure FPS control works), alte
 `seg_to_keys.py` contains functionality for cropping/warping the view to fit the piano keys. To give it a test, simply run connect a Canon camera and run the script. You should see a live stream that looks something like the following:
 <img width="1367" height="551" alt="Screenshot 2026-04-25 at 1 40 43 PM" src="https://github.com/user-attachments/assets/ed681501-d025-4cbc-ba7e-69251cf2a138" />
 <img width="1374" height="510" alt="Screenshot 2026-04-25 at 1 39 42 PM" src="https://github.com/user-attachments/assets/682c2714-a4d9-457d-9461-2219474c3e88" />
+<img width="957" height="535" alt="Screenshot 2026-04-28 at 4 20 09 PM" src="https://github.com/user-attachments/assets/5f64c6ac-2ab4-4697-94d5-ec7b1f7d9f19" />
 
-For best results, be sure to align the bottom and top rails of the keyboard parallel with the camera display. In normal lighting and without an excess of bright objects in frame, it should work well!
+The warping algorithm is now rotationally invariant, so in normal lighting and without an excess of bright objects in frame, it should work well!
 
 ## Note Labeling
 
