@@ -18,47 +18,33 @@ If one or more video streams are missing, you can try using `cam_probe.py` and `
  
 To change the image resolution or FPS (maybe - not sure FPS control works), alter the values in the `camera_config.yaml` file.
 
+### iPhone Continuity Camera
+
+`open_canon_streams()` filter rejects all non Canon camera streams by default, but iPhones can be accepted if the `allow_iphone` flag is passed as `True` to the function.
+
 ## Crop/Warp to Piano
 `seg_to_keys.py` contains functionality for cropping/warping the view to fit the piano keys. To give it a test, simply run connect a Canon camera and run the script. You should see a live stream that looks something like the following:
 <img width="1367" height="551" alt="Screenshot 2026-04-25 at 1 40 43 PM" src="https://github.com/user-attachments/assets/ed681501-d025-4cbc-ba7e-69251cf2a138" />
 <img width="1374" height="510" alt="Screenshot 2026-04-25 at 1 39 42 PM" src="https://github.com/user-attachments/assets/682c2714-a4d9-457d-9461-2219474c3e88" />
 
-For best results, be sure to align the bottom and top rails of the keyboard parallel with the camera display. In generally normal lighting and without an excess of bright objects in frame, it should work well!
+For best results, be sure to align the bottom and top rails of the keyboard parallel with the camera display. In normal lighting and without an excess of bright objects in frame, it should work well!
 
-## Crop/Warp to Piano
-`key_extractor2.py` contains functionality attempting to segment/detect the keys on the keyboard. The code uses edge detection and sobel filtering as part of the functionality to find the white key and black key edges for piano. Still pending significant improvement. Line 242 is where you can adjust the threshold of how sensitive the edge detector is. Can be run in 2 views: live uses functionalities from what was originally test_hough (now seg_to_keys.py). 
-
-to run:
-static image (more stable): uv run key_extractor2.py --mode image --image test_piano.avif
-live: uv run key_extractor2.py --mode live
-
-
-## Auto Calibration + Tight-Crop Labeler + Note Labeling (alternate pipeline)
-
-A static-image keyboard-detection + labeling pipeline lives in `auto_calibrate.py` + `key_labeler.py`. Separate from the live-stream pipeline in `seg_to_keys.py` / `key_extractor2.py`, and tuned for hand-held photos where that one struggles (the Hough rail finder picks up shelves/tiles as "rails", and the labeler assumes padding above/below the keys that doesn't exist in a tight crop).
-
-### iPhone Continuity Camera
-
-`stream_webcams.py`'s device filter accepts iPhones, so Continuity Camera works for `key_extractor2.py --mode live` without Canon hardware plugged in. The alt pipeline scripts below are all static-image.
+## Note Labeling
 
 ### Pipeline overview
-
-1. **Detect 4 loose corners** (`find_corners_auto`) from the white-key blob (top-down shots): isolate whites → horizontal dilate → pick largest wide-aspect contour → RANSAC-fit top/bottom rails → RANSAC-fit left/right rails on the pure-white lower region. For **side-view shots** where this fails, a manual `<photo>_calib.json` next to the image overrides auto-detection (these calib files are committed per camera mount).
-2. **Tighten the corners to key tops** (`tighten_corners_to_tops`) using the physical piano geometry: black keys are ~0.7× as tall as white keys on the Oxygen 61. Warp with the loose corners, detect where black keys end, compute where white key tops should end via the ratio, inverse-project back to original coords for tight corners.
-3. **Produce a tight warp** of just the key tops (= the keyboard's playable surface, no body / floor / front-face). This is what the labeler annotates AND what gets stored as the live runtime warp in `<photo>_keys.json` — so the next dev's press-detection runs against this same warp on every live frame. (The pipeline also computes a "loose" warp that includes the key front faces; this was an earlier idea for press-via-front-face-motion but is currently unused — the per-key safe-region masks generated from the tight warp serve press detection directly.)
-4. **Label the tight warp** (`draw_labels_tight_crop`):
-   - Find `y_black_bottom` (the red line) via Sobel-y horizontal edge.
-   - **Black-key detection** (`_detect_blacks_2d`): 2D Otsu connected-component on the upper band. Each merged blob (multi-key region) is split via **U-valley analysis** on the bottom-y profile of the blob mask, then each inner piece gets the **camera-far outer piece's actual contour** projected onto it as a local template. Z-order clipping resolves overlap between adjacent projected pieces. Falls back to 1D column-projection when 2D fails on top-down shots.
-   - **SWSSW projection** (`_project_to_25`) aligns detected blacks to the canonical 25-key pattern and fills any still-missing positions with translated template polygons.
-   - **Geometric edge guard** trims any polygon that over-extends past the keyboard's playable area (`0.5 * white_key_w` from the left edge, `1.5 * white_key_w` from the right edge — the 61-key C-to-C layout's natural buffer for C2 and B6+C7).
-   - **White-key seams**: Sobel-x peak detection on the white band, with local-median gap-fill (between detected peaks) and edge-extrapolation (past the first/last detected peak). Each seam draws through every row where no black-key polygon covers its column — one unified rule for partial vs full-height.
-   - **Note labels**: hardcoded canonical SWSSW pattern assigns letters; final labels are C#2..A#6 for blacks, C2..C7 for whites. Auto-scaled font size + 2-row stagger keeps labels readable on narrow side-view warps.
+1. Use `warp_to_piano` from `seg_to_keys.py` to obtain clean image of keys.
+2. Find `y_black_bottom` (the red line) via Sobel-y horizontal edge.
+3. **Black-key detection** (`_detect_blacks_2d`): 2D Otsu connected-component on the upper band. Each merged blob (multi-key region) is split via **U-valley analysis** on the bottom-y profile of the blob mask, then each inner piece gets the **camera-far outer piece's actual contour** projected onto it as a local template. Z-order clipping resolves overlap between adjacent projected pieces. Falls back to 1D column-projection when 2D fails on top-down shots.
+4. **SWSSW projection** (`_project_to_25`) aligns detected blacks to the canonical 25-key pattern and fills any still-missing positions with translated template polygons.
+5. **Geometric edge guard** trims any polygon that over-extends past the keyboard's playable area (`0.5 * white_key_w` from the left edge, `1.5 * white_key_w` from the right edge — the 61-key C-to-C layout's natural buffer for C2 and B6+C7).
+6. **White-key seams**: Sobel-x peak detection on the white band, with local-median gap-fill (between detected peaks) and edge-extrapolation (past the first/last detected peak). Each seam draws through every row where no black-key polygon covers its column — one unified rule for partial vs full-height.
+7. **Note labels**: hardcoded canonical SWSSW pattern assigns letters; final labels are C#2..A#6 for blacks, C2..C7 for whites. Auto-scaled font size + 2-row stagger keeps labels readable on narrow side-view warps.
 
 The `far_side` parameter on `draw_labels_tight_crop` / `_detect_blacks_2d` selects the camera-far direction (``"right"`` or ``"left"``). The 4-corner detection, geometric edge guard, and seam pipeline are all **camera-agnostic**; only the per-blob template-projection step is camera-side dependent. In a dual-cam rig each camera sets its own `far_side`.
 
 ### Scripts
-- **`key_labeler.py`** — core detection + labeling primitives. Can be run standalone on a single photo (uses `find_keyboard_bbox` for a simple axis-aligned crop): `uv run python key_labeler.py path/to/photo.jpg` → writes `<photo>_labeled.png`.
-- **`auto_calibrate.py`** — full 4-corner + tightening + labeling pipeline: `uv run python auto_calibrate.py piano_photos/IMG_9064.jpg piano_photos/IMG_9066.jpg` → writes `auto_calib_result.png` (grid: `corners | warped loose | warped tight + labels` per input).
+- **`key_labeler.py`** — Image labeling. Can be run standalone on a single photo: `uv run python key_labeler.py path/to/photo.jpg` → writes `<photo>_labeled.png`.
+- **`live_labeler.py`** - Stream labeling. Labels a canon stream live: `uv run python3 live_labeler.py`. NOTE: To enable iPhone streaming, make sure to pass in the `allow_iphone` flag as `True` to `open_canon_streams`.
 - **`manual_calibrate.py`** — fallback 4-click calibration for shots auto fails on. Click TL, TR, BR, BL. Saves `<photo>_warped.png`, `<photo>_labeled.png`, `<photo>_calib.json` next to the input.
 
 ### Labeler output
@@ -67,14 +53,6 @@ On the tight warped image:
 - **Blue polygons**: black-key outlines. Either the actual `cv2.findContours` contour for unmerged blobs, or the camera-far outer piece's contour translated to inner pieces of merged blobs (with overlap resolved by Z-order: closer key wins).
 - **Yellow vertical lines**: white-key seams. Drawn through every row of each seam's column where no black-key polygon covers that row — single unified rule, so seams go full-height in E|F / B|C gaps and clip above any black-key body otherwise.
 - **Note labels**: C#2–A#6 on blacks, C2–C7 on whites (assumes 61-key board with leftmost black = C#2; override `start_octave` in `_label_notes_61key` if different). Labels stagger across two y-rows so adjacent labels don't overlap on narrow warps.
-
-### Status
-
-**Top-down / front-on shots** (`IMG_9064`, `IMG_9065`, `IMG_9066`, `IMG_9072`, `IMG_9073`): auto corner detection + labeling work end-to-end.
-
-**Side-view shots** (`live_1776971374`, `live_1776972098`, plus the older `IMG_9067/8/70/71`): auto corner detection currently fails on these, so they use a manual `<photo>_calib.json` next to the image (4-click corners via `manual_calibrate.py`, then committed). The detection pipeline downstream of corners works on the manually-calibrated warps — extreme foreshortening on the camera-far end still produces some imperfect outlines (see "Remaining bugs" below).
-
-`IMG_9069` is shot from under the keyboard (only the stand visible) and isn't usable.
 
 ### Per-key region storage (handoff for next dev)
 
