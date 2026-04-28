@@ -36,6 +36,8 @@ def find_other_rail(first_rail, other_segs: list[np.ndarray]):
     return other_rail
     
 ### Old warp_to_piano \w Hough lines code:
+# edges = cv2.Canny(blob, 50, 150) # Canny edge detection
+# thick_edges = cv2.dilate(edges, np.ones((45, 1), np.uint8), iterations=1) # Bidirectional dilate (thicken detected edges for hough)
 
 # Hough transform (find lines from edges)
 _, W = thick_edges.shape

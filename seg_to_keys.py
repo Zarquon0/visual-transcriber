@@ -287,24 +287,23 @@ def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
     """
     Takes a more or less top down shot of a piano and warps + crops it to just its keys.
 
-    Isolate white pixels → Grayscale → Gaussian blur → Horizontal dilation (smears white keys) 
-    → Canny edges → Bidirectional dilation (thicken lines) → Hough lines (find lines from edges)
-    → Isolate keyboard bounding lines → Projective warp.
+    Isolate white pixels → Grayscale → Gaussian blur → Isolate white key blob 
+    → Find per row/col extreme points → Ransac extreme points to find lines
+    → Intersect lines to get corners → Projective warp.
     """
     threshed = isolate_white(frame) # Isolate white keys
     gray = cv2.cvtColor(threshed, cv2.COLOR_BGR2GRAY) # Grayscale (prepare for edge detection)
     blurred = cv2.GaussianBlur(gray, GAUSSIAN_KERNEL, GAUSSIAN_SIGMA) # Gaussian blur (remove noise)
     #smeared = cv2.dilate(blurred, np.ones((1, 20), np.uint8), iterations=1) # Horizontal dilate (smear white keys into a more uniform brick)
     blob = isolate_key_blob(blurred)
-    # edges = cv2.Canny(blob, 50, 150) # Canny edge detection
-    # thick_edges = cv2.dilate(edges, np.ones((45, 1), np.uint8), iterations=1) # Bidirectional dilate (thicken detected edges for hough)
 
     extreme_idcs = extrema(blob)
     extreme_lines = []
     for idx, idcs in enumerate(extreme_idcs):
         lines = find_multiple_lines(idcs, num_lines=3)
         if len(lines) == 0:
-            return (frame, threshed, blob, lines_vis, corners_vis, np.zeros_like(frame)) if debug else np.zeros_like(frame)
+            #return (frame, threshed, blob, lines_vis, corners_vis, np.zeros_like(frame)) if debug else np.zeros_like(frame)
+            return warped
         elif len(lines) == 1:
             extreme_lines.append(lines[0][:2])
         else:
@@ -327,9 +326,12 @@ def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
         intersect(extreme_lines[0], extreme_lines[3]), #tr
         intersect(extreme_lines[1], extreme_lines[2]), #bl
         intersect(extreme_lines[1], extreme_lines[3])  #br
-    ]
-    lines_vis = np.zeros_like(frame)
-    corners_vis = np.zeros_like(frame)
+    ]                                                                                                                  
+
+    first_rail = np.concatenate([corners[0], corners[1]])
+    second_rail = np.concatenate([corners[2], corners[3]])
+    warp_trans, warped = warp_key_lines(frame, first_rail, second_rail)
+
     if debug:
         H_f, W_f = frame.shape[:2]
         lines_vis = frame.copy()
@@ -356,13 +358,20 @@ def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
             cv2.putText(corners_vis, label, (pt[0] + 12, pt[1] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.polylines(corners_vis, [np.array(pts, dtype=np.int32).reshape(-1, 1, 2)],
-                      True, (0, 255, 0), 2)                                                                                                                        
-
-    first_rail = np.concatenate([corners[0], corners[1]])
-    second_rail = np.concatenate([corners[2], corners[3]])
-    warp_trans, warped = warp_key_lines(frame, first_rail, second_rail)
+                      True, (0, 255, 0), 2) 
         
-    return frame, threshed, blob, lines_vis, corners_vis, warped if debug else warped
+        mosaic = make_mosaic([
+            ("original", frame),
+            ("threshed", threshed),
+            ("blob", blob),
+            ("lines", lines_vis),
+            ("corners", corners_vis),
+            ("warped", warped),
+        ])
+        cv2.imshow("debug_mosaic", mosaic)  
+
+    corners_in_ac_format = np.stack([corners[0], corners[1], corners[3], corners[2]]).astype(np.float32)
+    return warped, warp_trans, corners_in_ac_format
 
 
 def stream_to_piano(stream: CanonStream, window_name: str = "keyboard_stream"):
@@ -373,16 +382,8 @@ def stream_to_piano(stream: CanonStream, window_name: str = "keyboard_stream"):
         if not grabbed or frame is None:
             print("Failed to read from camera")
             break
-        original, threshed, blob, lines_vis, corners_vis, warped = warp_to_piano(frame, debug=True)
-        mosaic = make_mosaic([
-            ("original", original),
-            ("threshed", threshed),
-            ("blob", blob),
-            ("lines", lines_vis),
-            ("corners", corners_vis),
-            ("warped", warped),
-        ])
-        cv2.imshow(window_name, mosaic)
+        warped, _, _ = warp_to_piano(frame, debug=True)
+        cv2.imshow("warped", warped)
         if cv2.waitKey(1) & 0xFF == 27:
             break
     stream.stop()
@@ -391,16 +392,8 @@ def stream_to_piano(stream: CanonStream, window_name: str = "keyboard_stream"):
 def pics_to_piano(paths: list[str], window_name: str = "keyboard_stream"):
     for path in paths:
         img = load_image(path)
-        original, threshed, blob, lines_vis, corners_vis, warped = warp_to_piano(img, debug=True)
-        mosaic = make_mosaic([
-            ("original", original),
-            ("threshed", threshed),
-            ("blob", blob),
-            ("lines", lines_vis),
-            ("corners", corners_vis),
-            ("warped", warped),
-        ])
-        cv2.imshow(window_name, mosaic)
+        warped, _, _ = warp_to_piano(img, debug=True)
+        cv2.imshow(window_name, warped)
         cv2.waitKey(0)
 
 if __name__ == "__main__":

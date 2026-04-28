@@ -26,8 +26,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from auto_calibrate import find_corners_auto, tighten_corners_to_tops, warp_from_corners
-from key_labeler import draw_labels_tight_crop, find_keyboard_bbox, load_image, warp_to_bbox
+#from auto_calibrate import find_corners_auto, tighten_corners_to_tops, warp_from_corners
+from seg_to_keys import warp_to_piano
+from key_labeler import draw_labels_tight_crop, load_image#, warp_to_bbox, find_keyboard_bbox
 from stream_webcams import open_canon_streams
 
 CORNER_REFRESH = 45
@@ -61,11 +62,12 @@ def _side_by_side(left: np.ndarray, right: np.ndarray, h: int = 360) -> np.ndarr
 
 def run_image(path: str) -> None:
     frame = load_image(path)
-    bbox = find_keyboard_bbox(frame)
-    if bbox is None:
-        print("could not locate keyboard")
-        return
-    labeled = draw_labels_tight_crop(warp_to_bbox(frame, bbox))
+    # bbox = find_keyboard_bbox(frame)
+    # if bbox is None:
+    #     print("could not locate keyboard")
+    #     return
+    # labeled = draw_labels_tight_crop(warp_to_bbox(frame, bbox))
+    labeled = draw_labels_tight_crop(warp_to_piano(frame))
     out = Path(path).with_suffix("").as_posix() + "_labeled.png"
     cv2.imwrite(out, labeled)
     print(f"wrote {out}")
@@ -99,25 +101,34 @@ def run_live(cam_index: int | None, mode: str) -> None:
 
         redetect = frame_count % CORNER_REFRESH == 0
 
-        if mode == "bbox":
-            bbox = find_keyboard_bbox(frame)
-            labeled = draw_labels_tight_crop(warp_to_bbox(frame, bbox)) if bbox else None
-            overlay = frame
-        else:
-            if redetect or cached_corners is None:
-                cached_corners = find_corners_auto(frame)
-            if cached_corners is not None:
-                try:
-                    tight = tighten_corners_to_tops(frame, cached_corners)
-                    labeled = draw_labels_tight_crop(warp_from_corners(frame, tight))
-                except Exception:
-                    labeled = None
-            else:
-                labeled = None
-            overlay = _corner_overlay(frame, cached_corners) if cached_corners is not None else frame
+        # if mode == "bbox":
+        #     bbox = find_keyboard_bbox(frame)
+        #     labeled = draw_labels_tight_crop(warp_to_bbox(frame, bbox)) if bbox else None
+        #     overlay = frame
+        # else:
+        #     if redetect or cached_corners is None:
+        #         cached_corners = find_corners_auto(frame)
+        #     if cached_corners is not None:
+        #         try:
+        #             tight = tighten_corners_to_tops(frame, cached_corners)
+        #             labeled = draw_labels_tight_crop(warp_from_corners(frame, tight))
+        #         except Exception as e:
+        #             labeled = None
+        #     else:
+        #         labeled = None
+        #     overlay = _corner_overlay(frame, cached_corners) if cached_corners is not None else frame
+        try:
+            if redetect or cached_corners is None or labeled is None:
+                warped, _trans, corners = warp_to_piano(frame)
+                cached_corners = corners
+                labeled = draw_labels_tight_crop(warped)
+        except Exception as e:
+            cached_corners = None
+            labeled = None
 
         if labeled is not None:
             last_labeled = labeled
+        overlay = _corner_overlay(frame, cached_corners) if cached_corners is not None else frame
 
         right = last_labeled if last_labeled is not None else np.zeros_like(frame)
         display = _side_by_side(overlay, right)
