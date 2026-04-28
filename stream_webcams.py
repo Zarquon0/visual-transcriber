@@ -16,7 +16,7 @@ def _load_config(path: Path = _CONFIG_PATH) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def find_canon_indices() -> list[int]:
+def find_canon_indices(allow_iphone=False) -> list[int]:
     """Return OpenCV VideoCapture indices for all connected Canon cameras on macOS.
 
     Uses Swift to enumerate AVFoundation video devices by name, then maps them
@@ -51,7 +51,8 @@ for d in devices {
         (builtin if flag.strip() == "1" else external).append(name.strip())
 
     opencv_order = external + builtin
-    return [i for i, name in enumerate(opencv_order) if "Canon" in name or "iPhone" in name]
+    valid_cam_name = (lambda name: "Canon" in name or "iPhone" in name) if allow_iphone else (lambda name: "Canon" in name)
+    return [i for i, name in enumerate(opencv_order) if valid_cam_name(name)]
 
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
@@ -106,22 +107,23 @@ class CanonStream():
     def update(self):
         while self.started:
             grabbed, frame = self.cap.read()
-            if frame.shape[0] != self.height or frame.shape[1] != self.width:
-                # Manual resize if not receiving requested image resolution
-                frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-            if self._show_stats and grabbed and frame is not None:
-                # Update image stream stats, if desired
-                now = time.perf_counter()
-                self._frame_times.append(now)
-                cutoff = now - 1.0
-                while self._frame_times and self._frame_times[0] < cutoff:
-                    self._frame_times.popleft()
-                self._measured_fps = len(self._frame_times)
-                h, w = frame.shape[:2]
-                self._measured_res = (w, h)
-            with self.read_lock:
-                self.grabbed = grabbed
-                self.frame = frame
+            if not (frame is None): #On continuity cam, frame is sometimes None - in that case, just don't update
+                if frame.shape[0] != self.height or frame.shape[1] != self.width:
+                    # Manual resize if not receiving requested image resolution
+                    frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+                if self._show_stats and grabbed and frame is not None:
+                    # Update image stream stats, if desired
+                    now = time.perf_counter()
+                    self._frame_times.append(now)
+                    cutoff = now - 1.0
+                    while self._frame_times and self._frame_times[0] < cutoff:
+                        self._frame_times.popleft()
+                    self._measured_fps = len(self._frame_times)
+                    h, w = frame.shape[:2]
+                    self._measured_res = (w, h)
+                with self.read_lock:
+                    self.grabbed = grabbed
+                    self.frame = frame
 
     def read(self) -> tuple[bool, MatLike]:
         with self.read_lock:
@@ -144,14 +146,14 @@ class CanonStream():
         self.cap.release()
         self.thread.join(timeout=2.0)
 
-def open_canon_streams(config_path: Path = _CONFIG_PATH, silent = True) -> list[CanonStream]:
+def open_canon_streams(config_path: Path = _CONFIG_PATH, allow_iphone=False, silent = True) -> list[CanonStream]:
     """Detect all Canon cameras and return a list of opened VideoCapture objects.
 
     Resolution and frame rate are applied from the config yaml. Raises
     RuntimeError if no Canon cameras are found.
     """
 
-    indices = find_canon_indices()
+    indices = find_canon_indices(allow_iphone=allow_iphone)
     if not indices:
         raise RuntimeError("No Canon cameras detected")
 
