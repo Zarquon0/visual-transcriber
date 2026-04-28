@@ -12,10 +12,11 @@ from typing import Any, Dict, List
 import cv2
 import numpy as np
 
-from auto_calibrate import find_corners_auto, tighten_corners_to_tops, warp_from_corners
+#from auto_calibrate import find_corners_auto, tighten_corners_to_tops, warp_from_corners
 from calibration import Calibration
-from key_labeler import draw_labels_tight_crop, find_keyboard_bbox, warp_to_bbox
+from key_labeler import draw_labels_tight_crop#, find_keyboard_bbox, warp_to_bbox
 from live_labeler import CORNER_REFRESH, _corner_overlay, _side_by_side, _status
+from seg_to_keys import warp_to_piano
 from stream_webcams import open_canon_streams
 
 
@@ -133,30 +134,34 @@ def run_live(cam_index: int | None, mode: str, calibration_path: str) -> None:
         redetect = frame_count % CORNER_REFRESH == 0
         warped = None
 
-        if mode == "bbox":
-            bbox = find_keyboard_bbox(frame)
-            if bbox:
-                warped = warp_to_bbox(frame, bbox)
+        # if mode == "bbox":
+        #     bbox = find_keyboard_bbox(frame)
+        #     labeled = draw_labels_tight_crop(warp_to_bbox(frame, bbox)) if bbox else None
+        #     overlay = frame
+        # else:
+        #     if redetect or cached_corners is None:
+        #         cached_corners = find_corners_auto(frame)
+        #     if cached_corners is not None:
+        #         try:
+        #             tight = tighten_corners_to_tops(frame, cached_corners)
+        #             labeled = draw_labels_tight_crop(warp_from_corners(frame, tight))
+        #         except Exception as e:
+        #             labeled = None
+        #     else:
+        #         labeled = None
+        #     overlay = _corner_overlay(frame, cached_corners) if cached_corners is not None else frame
+        try:
+            if redetect or cached_corners is None or labeled is None:
+                warped, _trans, corners = warp_to_piano(frame)
+                cached_corners = corners
                 labeled = draw_labels_tight_crop(warped)
-            else:
-                labeled = None
-            overlay = frame
+        except Exception as e:
+            cached_corners = None
+            labeled = None
+        overlay = _corner_overlay(frame, cached_corners) if cached_corners is not None else frame
 
-        else:
-            if redetect or cached_corners is None:
-                cached_corners = find_corners_auto(frame)
-
-            if cached_corners is not None:
-                try:
-                    tight = tighten_corners_to_tops(frame, cached_corners)
-                    warped = warp_from_corners(frame, tight)
-                    labeled = draw_labels_tight_crop(warped)
-                except Exception:
-                    labeled = None
-            else:
-                labeled = None
-
-            overlay = _corner_overlay(frame, cached_corners) if cached_corners is not None else frame
+        if labeled is not None:
+            last_labeled = labeled
 
         if warped is not None:
             events = process_frame(detector, warped)
