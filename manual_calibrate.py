@@ -15,7 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from key_labeler import load_image, draw_labels_tight_crop
+from core.key_labeler import load_image, draw_labels_tight_crop
 
 
 MAX_DISPLAY = 1400  # max dimension for the display window

@@ -102,7 +102,7 @@ def build_calibration_data(
     on live frames.
     """
     # Local imports keep this module decoupled at import time.
-    from key_labeler import (
+    from .key_labeler import (
         _detect_blacks_2d,
         _detect_blacks_1d,
         _project_to_25,

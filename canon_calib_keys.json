@@ -1,0 +1,1216 @@
+{
+  "version": 1,
+  "camera_id": "canon",
+  "far_side": "right",
+  "warp": {
+    "corners_tl_tr_br_bl": [
+      [
+        1130.359619140625,
+        259.92584228515625
+      ],
+      [
+        151.10902404785156,
+        693.0426025390625
+      ],
+      [
+        44.87913131713867,
+        314.98199462890625
+      ],
+      [
+        1099.697021484375,
+        70.72469329833984
+      ]
+    ],
+    "out_size": [
+      1070,
+      287
+    ]
+  },
+  "y_black_bottom": 127,
+  "keys": [
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          286
+        ],
+        [
+          74,
+          286
+        ],
+        [
+          74,
+          0
+        ]
+      ],
+      "bbox": [
+        0,
+        0,
+        75,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 12.264387464387465,
+      "safe_bbox": [
+        15,
+        144,
+        45,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          75,
+          0
+        ],
+        [
+          75,
+          286
+        ],
+        [
+          195,
+          286
+        ],
+        [
+          195,
+          0
+        ]
+      ],
+      "bbox": [
+        75,
+        0,
+        121,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 11.496794871794872,
+      "safe_bbox": [
+        99,
+        144,
+        72,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          196,
+          0
+        ],
+        [
+          196,
+          286
+        ],
+        [
+          209,
+          286
+        ],
+        [
+          209,
+          0
+        ]
+      ],
+      "bbox": [
+        196,
+        0,
+        14,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 193.40865384615384,
+      "safe_bbox": [
+        198,
+        144,
+        8,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          210,
+          0
+        ],
+        [
+          210,
+          286
+        ],
+        [
+          246,
+          286
+        ],
+        [
+          246,
+          0
+        ]
+      ],
+      "bbox": [
+        210,
+        0,
+        37,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 11.927156177156178,
+      "safe_bbox": [
+        217,
+        144,
+        22,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          247,
+          0
+        ],
+        [
+          247,
+          286
+        ],
+        [
+          283,
+          286
+        ],
+        [
+          283,
+          0
+        ]
+      ],
+      "bbox": [
+        247,
+        0,
+        37,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 17.143939393939394,
+      "safe_bbox": [
+        254,
+        144,
+        22,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          284,
+          0
+        ],
+        [
+          284,
+          286
+        ],
+        [
+          299,
+          286
+        ],
+        [
+          299,
+          0
+        ]
+      ],
+      "bbox": [
+        284,
+        0,
+        16,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 194.5099715099715,
+      "safe_bbox": [
+        287,
+        144,
+        9,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          300,
+          0
+        ],
+        [
+          300,
+          286
+        ],
+        [
+          336,
+          286
+        ],
+        [
+          336,
+          0
+        ]
+      ],
+      "bbox": [
+        300,
+        0,
+        37,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 12.443473193473194,
+      "safe_bbox": [
+        307,
+        144,
+        22,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          337,
+          0
+        ],
+        [
+          337,
+          286
+        ],
+        [
+          370,
+          286
+        ],
+        [
+          370,
+          0
+        ]
+      ],
+      "bbox": [
+        337,
+        0,
+        34,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 11.987179487179487,
+      "safe_bbox": [
+        343,
+        144,
+        20,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          371,
+          0
+        ],
+        [
+          371,
+          286
+        ],
+        [
+          403,
+          286
+        ],
+        [
+          403,
+          0
+        ]
+      ],
+      "bbox": [
+        371,
+        0,
+        33,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 17.475033738191634,
+      "safe_bbox": [
+        377,
+        144,
+        19,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          404,
+          0
+        ],
+        [
+          404,
+          286
+        ],
+        [
+          421,
+          286
+        ],
+        [
+          421,
+          0
+        ]
+      ],
+      "bbox": [
+        404,
+        0,
+        18,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 195.84871794871796,
+      "safe_bbox": [
+        407,
+        144,
+        10,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          422,
+          0
+        ],
+        [
+          422,
+          286
+        ],
+        [
+          455,
+          286
+        ],
+        [
+          455,
+          0
+        ]
+      ],
+      "bbox": [
+        422,
+        0,
+        34,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 13.878205128205128,
+      "safe_bbox": [
+        428,
+        144,
+        20,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          456,
+          0
+        ],
+        [
+          456,
+          286
+        ],
+        [
+          491,
+          286
+        ],
+        [
+          491,
+          0
+        ]
+      ],
+      "bbox": [
+        456,
+        0,
+        36,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 17.64163614163614,
+      "safe_bbox": [
+        463,
+        144,
+        21,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          492,
+          0
+        ],
+        [
+          492,
+          286
+        ],
+        [
+          512,
+          286
+        ],
+        [
+          512,
+          0
+        ]
+      ],
+      "bbox": [
+        492,
+        0,
+        21,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 199.32264957264957,
+      "safe_bbox": [
+        496,
+        144,
+        12,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          513,
+          0
+        ],
+        [
+          513,
+          286
+        ],
+        [
+          543,
+          286
+        ],
+        [
+          543,
+          0
+        ]
+      ],
+      "bbox": [
+        513,
+        0,
+        31,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 14.29131054131054,
+      "safe_bbox": [
+        519,
+        144,
+        18,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          544,
+          0
+        ],
+        [
+          544,
+          286
+        ],
+        [
+          577,
+          286
+        ],
+        [
+          577,
+          0
+        ]
+      ],
+      "bbox": [
+        544,
+        0,
+        34,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 13.789102564102564,
+      "safe_bbox": [
+        550,
+        144,
+        20,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          578,
+          0
+        ],
+        [
+          578,
+          286
+        ],
+        [
+          611,
+          286
+        ],
+        [
+          611,
+          0
+        ]
+      ],
+      "bbox": [
+        578,
+        0,
+        34,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 17.4,
+      "safe_bbox": [
+        584,
+        144,
+        20,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          612,
+          0
+        ],
+        [
+          612,
+          286
+        ],
+        [
+          633,
+          286
+        ],
+        [
+          633,
+          0
+        ]
+      ],
+      "bbox": [
+        612,
+        0,
+        22,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 196.98717948717947,
+      "safe_bbox": [
+        616,
+        144,
+        13,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          634,
+          0
+        ],
+        [
+          634,
+          286
+        ],
+        [
+          663,
+          286
+        ],
+        [
+          663,
+          0
+        ]
+      ],
+      "bbox": [
+        634,
+        0,
+        30,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 16.813390313390315,
+      "safe_bbox": [
+        640,
+        144,
+        18,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          664,
+          0
+        ],
+        [
+          664,
+          286
+        ],
+        [
+          698,
+          286
+        ],
+        [
+          698,
+          0
+        ]
+      ],
+      "bbox": [
+        664,
+        0,
+        35,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 17.449328449328448,
+      "safe_bbox": [
+        671,
+        144,
+        21,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          699,
+          0
+        ],
+        [
+          699,
+          286
+        ],
+        [
+          723,
+          286
+        ],
+        [
+          723,
+          0
+        ]
+      ],
+      "bbox": [
+        699,
+        0,
+        25,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 196.64615384615385,
+      "safe_bbox": [
+        704,
+        144,
+        15,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          724,
+          0
+        ],
+        [
+          724,
+          286
+        ],
+        [
+          751,
+          286
+        ],
+        [
+          751,
+          0
+        ]
+      ],
+      "bbox": [
+        724,
+        0,
+        28,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 16.635416666666668,
+      "safe_bbox": [
+        729,
+        144,
+        16,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          752,
+          0
+        ],
+        [
+          752,
+          286
+        ],
+        [
+          784,
+          286
+        ],
+        [
+          784,
+          0
+        ]
+      ],
+      "bbox": [
+        752,
+        0,
+        33,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 16.535087719298247,
+      "safe_bbox": [
+        758,
+        144,
+        19,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          785,
+          0
+        ],
+        [
+          785,
+          286
+        ],
+        [
+          818,
+          286
+        ],
+        [
+          818,
+          0
+        ]
+      ],
+      "bbox": [
+        785,
+        0,
+        34,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 22.26794871794872,
+      "safe_bbox": [
+        791,
+        144,
+        20,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          819,
+          0
+        ],
+        [
+          819,
+          286
+        ],
+        [
+          844,
+          286
+        ],
+        [
+          844,
+          0
+        ]
+      ],
+      "bbox": [
+        819,
+        0,
+        26,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 193.88547008547008,
+      "safe_bbox": [
+        824,
+        144,
+        15,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          845,
+          0
+        ],
+        [
+          845,
+          286
+        ],
+        [
+          870,
+          286
+        ],
+        [
+          870,
+          0
+        ]
+      ],
+      "bbox": [
+        845,
+        0,
+        26,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 17.76752136752137,
+      "safe_bbox": [
+        850,
+        144,
+        15,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          871,
+          0
+        ],
+        [
+          871,
+          286
+        ],
+        [
+          906,
+          286
+        ],
+        [
+          906,
+          0
+        ]
+      ],
+      "bbox": [
+        871,
+        0,
+        36,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 37.843711843711844,
+      "safe_bbox": [
+        878,
+        144,
+        21,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          907,
+          0
+        ],
+        [
+          907,
+          286
+        ],
+        [
+          934,
+          286
+        ],
+        [
+          934,
+          0
+        ]
+      ],
+      "bbox": [
+        907,
+        0,
+        28,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 189.3790064102564,
+      "safe_bbox": [
+        912,
+        144,
+        16,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          935,
+          0
+        ],
+        [
+          935,
+          286
+        ],
+        [
+          959,
+          286
+        ],
+        [
+          959,
+          0
+        ]
+      ],
+      "bbox": [
+        935,
+        0,
+        25,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 17.643589743589743,
+      "safe_bbox": [
+        940,
+        144,
+        15,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          960,
+          0
+        ],
+        [
+          960,
+          286
+        ],
+        [
+          993,
+          286
+        ],
+        [
+          993,
+          0
+        ]
+      ],
+      "bbox": [
+        960,
+        0,
+        34,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 40.19679487179487,
+      "safe_bbox": [
+        966,
+        144,
+        20,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          994,
+          0
+        ],
+        [
+          994,
+          286
+        ],
+        [
+          1026,
+          286
+        ],
+        [
+          1026,
+          0
+        ]
+      ],
+      "bbox": [
+        994,
+        0,
+        33,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 40.75978407557355,
+      "safe_bbox": [
+        1000,
+        144,
+        19,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          1027,
+          0
+        ],
+        [
+          1027,
+          286
+        ],
+        [
+          1043,
+          286
+        ],
+        [
+          1043,
+          0
+        ]
+      ],
+      "bbox": [
+        1027,
+        0,
+        17,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 184.07820512820513,
+      "safe_bbox": [
+        1030,
+        144,
+        10,
+        78
+      ]
+    },
+    {
+      "note": "?",
+      "type": "white",
+      "polygon": [
+        [
+          1044,
+          0
+        ],
+        [
+          1044,
+          286
+        ],
+        [
+          1068,
+          286
+        ],
+        [
+          1068,
+          0
+        ]
+      ],
+      "bbox": [
+        1044,
+        0,
+        25,
+        287
+      ],
+      "source": "geometric",
+      "confidence": 0.85,
+      "baseline_intensity": 193.34188034188034,
+      "safe_bbox": [
+        1049,
+        144,
+        15,
+        78
+      ]
+    }
+  ]
+}

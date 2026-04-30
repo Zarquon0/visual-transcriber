@@ -31,8 +31,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from key_labeler import load_image
-from calibration import Calibration
+from core.key_labeler import load_image
+from core.calibration import Calibration
 
 
 SOURCE_COLORS_BGR = {

@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import sys
-from stream_webcams import CanonStream, open_canon_streams
+from .stream_webcams import CanonStream, open_canon_streams
 
 #
 # Hyperparameters

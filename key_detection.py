@@ -13,11 +13,11 @@ import cv2
 import numpy as np
 
 #from auto_calibrate import find_corners_auto, tighten_corners_to_tops, warp_from_corners
-from calibration import Calibration
-from key_labeler import draw_labels_tight_crop#, find_keyboard_bbox, warp_to_bbox
-from live_labeler import CORNER_REFRESH, _corner_overlay, _side_by_side, _status
-from seg_to_keys import warp_to_piano
-from stream_webcams import open_canon_streams
+from core.calibration import Calibration
+from core.key_labeler import draw_labels_tight_crop#, find_keyboard_bbox, warp_to_bbox
+from core.display_utils import CORNER_REFRESH, _corner_overlay, _side_by_side, _status
+from core.seg_to_keys import warp_to_piano, isolate_white
+from core.stream_webcams import open_canon_streams
 
 
 def initialise(calibration_path: str) -> None:
@@ -45,6 +45,11 @@ def process_frame(detector: Dict[str, Any], warped: np.ndarray) -> List[Dict[str
     grayscale = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     grayscale = cv2.GaussianBlur(grayscale, (5, 5), 0)
 
+    # White-surface mask: pixels that are white-key brightness in this frame.
+    # Hand/skin pixels are not white so they are excluded, preventing hand
+    # occlusion from changing a white key's measured intensity.
+    white_bool = isolate_white(warped)[:, :, 0].astype(bool)
+
     events_out = []
     prev_grayscale = detector["prev_grayscale"]
 
@@ -52,7 +57,17 @@ def process_frame(detector: Dict[str, Any], warped: np.ndarray) -> List[Dict[str
         note = key.note
         state = detector["states"][note]
 
-        region = grayscale[key.safe_mask]
+        if key.type == "white":
+            # Only use pixels that are visibly white-key surface (hand pixels excluded).
+            visible = key.safe_mask & white_bool
+            coverage = visible.sum() / max(1, key.safe_mask.sum())
+            if coverage < 0.3:
+                # Hand covers >70% of this key — treat as occluded, skip detection.
+                continue
+            region = grayscale[visible]
+        else:
+            region = grayscale[key.safe_mask]
+
         if region.size == 0:
             continue
 
@@ -61,15 +76,18 @@ def process_frame(detector: Dict[str, Any], warped: np.ndarray) -> List[Dict[str
 
         motion = 0.0
         if prev_grayscale is not None:
-            prev_region = prev_grayscale[key.safe_mask]
-            if prev_region.shape == region.shape:
+            if key.type == "white":
+                prev_region = prev_grayscale[visible]
+            else:
+                prev_region = prev_grayscale[key.safe_mask]
+            if prev_region.size > 0 and prev_region.shape == region.shape:
                 motion = float(np.mean(cv2.absdiff(region, prev_region)))
 
         uncertainty = 1 - key.confidence
 
         active = (
             abs(delta) > detector["threshold"] * (1 + uncertainty)
-            or motion > detector["motion_threshold"] * (1 + uncertainty)
+            and motion > detector["motion_threshold"] * (1 + uncertainty)
         )
 
         if active:
