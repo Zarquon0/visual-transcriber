@@ -4,3 +4,16 @@ resolution:
 
 # Frame rate (fps). Set to null to leave at camera default (30).
 fps: null
+
+# Substrings to match against AVFoundation device names (case-sensitive).
+# Add your camera's name here if it isn't detected automatically.
+camera_name_patterns:
+  - Canon
+  - EOS
+
+# Per-camera rotation applied before any processing (0, 90, 180, or 270).
+# Index 0 = first detected Canon camera, index 1 = second, etc.
+# Use 180 for a camera that is physically mounted upside-down.
+camera_rotate:
+  - 0    # camera 0: normal
+  - 0    # camera 1: change to 180 if warped image is upside-down

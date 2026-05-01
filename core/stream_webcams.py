@@ -16,13 +16,15 @@ def _load_config(path: Path = _CONFIG_PATH) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def find_canon_indices(allow_iphone=False) -> list[int]:
+def find_canon_indices(allow_iphone=False, config_path: Path = _CONFIG_PATH) -> list[int]:
     """Return OpenCV VideoCapture indices for all connected Canon cameras on macOS.
 
     Uses Swift to enumerate AVFoundation video devices by name, then maps them
     to OpenCV indices. OpenCV's AVFoundation backend orders external (USB /
     non-built-in) cameras before built-in cameras, preserving each group's
     relative AVFoundation order within itself.
+
+    Name patterns are read from camera_config.yaml (camera_name_patterns key).
     """
     swift_code = r"""
 import AVFoundation
@@ -51,19 +53,37 @@ for d in devices {
         (builtin if flag.strip() == "1" else external).append(name.strip())
 
     opencv_order = external + builtin
-    valid_cam_name = (lambda name: "Canon" in name or "iPhone" in name) if allow_iphone else (lambda name: "Canon" in name)
+
+    try:
+        cfg = _load_config(config_path)
+        patterns: list[str] = cfg.get("camera_name_patterns", ["Canon", "EOS"])
+    except Exception:
+        patterns = ["Canon", "EOS"]
+    if allow_iphone:
+        patterns = list(patterns) + ["iPhone"]
+
+    def valid_cam_name(name: str) -> bool:
+        return any(p in name for p in patterns)
+
     return [i for i, name in enumerate(opencv_order) if valid_cam_name(name)]
 
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
+_ROTATE_CODES = {
+    90:  cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
 class CanonStream():
     """
     Wrapper around a cv2 VideoCapture stream that decouples reading an image from the camera to python
     from reading an image from memory for further processing, pipelining the process and reducing latency
     """
-    def __init__(self, src: int, cfg: dict = None, show_stats: bool = False):
+    def __init__(self, src: int, cfg: dict = None, show_stats: bool = False, rotate: int = 0):
         # Make capture object
         self.cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
+        self._rotate_code = _ROTATE_CODES.get(rotate % 360)
 
         # Read configuration and set resolution/frame rate
         if cfg:
@@ -84,7 +104,9 @@ class CanonStream():
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         # Initialize other state
-        self.grabbed, self.frame = self.cap.read()
+        ok, raw = self.cap.read()
+        self.grabbed = ok
+        self.frame = cv2.rotate(raw, self._rotate_code) if (ok and raw is not None and self._rotate_code is not None) else raw
         self.started = False
         self.read_lock = threading.Lock()
         self.height = height
@@ -108,6 +130,8 @@ class CanonStream():
         while self.started:
             grabbed, frame = self.cap.read()
             if not (frame is None): #On continuity cam, frame is sometimes None - in that case, just don't update
+                if self._rotate_code is not None:
+                    frame = cv2.rotate(frame, self._rotate_code)
                 if frame.shape[0] != self.height or frame.shape[1] != self.width:
                     # Manual resize if not receiving requested image resolution
                     frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
@@ -161,12 +185,14 @@ def open_canon_streams(config_path: Path = _CONFIG_PATH, allow_iphone=False, sil
         print(f"Detected {len(indices)} Canon camera(s) at OpenCV indices: {indices}")
 
     cfg = _load_config(config_path)
+    rotations: list[int] = cfg.get("camera_rotate", [])
     streams = []
-    for idx in indices:
-        stream = CanonStream(idx, cfg, show_stats=True)
+    for stream_idx, cv_idx in enumerate(indices):
+        rotate = rotations[stream_idx] if stream_idx < len(rotations) else 0
+        stream = CanonStream(cv_idx, cfg, show_stats=True, rotate=rotate)
         streams.append(stream)
         if not silent:
-            print(f"  cam{idx} opened: {stream.cap.isOpened()}")
+            print(f"  cam{cv_idx} opened: {stream.cap.isOpened()}  rotate={rotate}")
 
     return streams
 

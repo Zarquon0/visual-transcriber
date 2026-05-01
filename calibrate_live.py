@@ -30,43 +30,142 @@ from core.calibration import build_calibration_data, save_calibration
 from core.key_labeler import draw_labels_tight_crop
 from core.seg_to_keys import warp_to_piano
 from core.stream_webcams import open_canon_streams
+from core.warp_calibration import auto_warp_to_key_tops
+from pathlib import Path
 
 WARMUP_SECS = 2
 
 
-def _capture_frame() -> np.ndarray:
-    """Open the first Canon stream, warm up, and return one frame."""
-    streams = open_canon_streams(silent=False)
-    if not streams:
+def _capture_frame(stream_index: int = 0) -> np.ndarray:
+    """Open one selected Canon stream, warm up, and return one frame.
+
+    Important:
+    Do NOT call open_canon_streams() here, because that opens every Canon
+    camera even when we only want one. On macOS, opening both cameras can
+    cause AVFoundation/OpenCV warnings or hangs.
+    """
+    from core.stream_webcams import find_canon_indices, _load_config
+
+    print(f"[calibrate_live] locating Canon stream {stream_index}...")
+
+    indices = find_canon_indices()
+    if not indices:
         raise RuntimeError("No Canon camera found. Check USB connection and webcam mode.")
-    stream = streams[0]
-    stream.start()
+
+    if stream_index < 0 or stream_index >= len(indices):
+        raise RuntimeError(
+            f"Requested --stream {stream_index}, but only {len(indices)} Canon camera(s) "
+            f"were detected. Available stream numbers: 0..{len(indices) - 1}"
+        )
+
+    cv_index = indices[stream_index]
+    cfg = _load_config()
+
+    width = int(cfg.get("resolution", {}).get("width", 1280))
+    height = int(cfg.get("resolution", {}).get("height", 720))
+    fps = cfg.get("fps")
+
+    rotate_values = cfg.get("camera_rotate", [])
+    rotate = 0
+    if isinstance(rotate_values, list) and stream_index < len(rotate_values):
+        rotate = int(rotate_values[stream_index] or 0)
+
+    rotate_codes = {
+        90: cv2.ROTATE_90_CLOCKWISE,
+        180: cv2.ROTATE_180,
+        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    }
+    rotate_code = rotate_codes.get(rotate % 360)
+
+    print(
+        f"[calibrate_live] opening stream {stream_index} "
+        f"(OpenCV index {cv_index}, {width}x{height}, rotate={rotate})..."
+    )
+
+    cap = cv2.VideoCapture(cv_index, cv2.CAP_AVFOUNDATION)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open Canon camera at OpenCV index {cv_index}.")
+
     try:
-        time.sleep(WARMUP_SECS)
-        ok, frame = stream.read()
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if fps is not None:
+            cap.set(cv2.CAP_PROP_FPS, float(fps))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Warm up and drain a few frames.
+        deadline = time.time() + WARMUP_SECS
+        frame = None
+        ok = False
+
+        while time.time() < deadline:
+            ok, frame = cap.read()
+            time.sleep(0.03)
+
+        # Try a few final reads after warmup.
+        for _ in range(20):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                break
+            time.sleep(0.05)
+
         if not ok or frame is None:
-            raise RuntimeError("Failed to read a frame from the Canon stream.")
+            raise RuntimeError(
+                f"Opened camera {stream_index}, but failed to read a valid frame."
+            )
+
+        if rotate_code is not None:
+            frame = cv2.rotate(frame, rotate_code)
+
+        print(f"[calibrate_live] captured frame: {frame.shape[1]}x{frame.shape[0]}")
         return frame
+
     finally:
-        stream.stop()
+        cap.release()
 
 
 def _try_warp(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
-    """Run warp_to_piano; return (warped, corners) or (None, None) on failure."""
+    """Run the repo's original live keyboard warp.
+
+    This intentionally uses seg_to_keys.warp_to_piano, not the experimental
+    auto-calibration helper.
+    """
     try:
-        warped, _, corners = warp_to_piano(frame)
+        result = warp_to_piano(frame)
     except Exception as e:
-        print(f"[calibrate_live] warp error: {e}")
+        print(f"[calibrate_live] warp_to_piano error: {e}")
         return None, None
-    if warped is None or corners is None:
+
+    # Current repo version appears to return:
+    #     warped, debug_or_mask, corners
+    # but this keeps it tolerant if that changes slightly.
+    if isinstance(result, tuple):
+        if len(result) >= 3:
+            warped = result[0]
+            corners = result[2]
+        elif len(result) == 2:
+            warped, corners = result
+        else:
+            warped = result[0]
+            corners = None
+    else:
+        warped = result
+        corners = None
+
+    if warped is None or warped.size == 0:
+        print("[calibrate_live] warp_to_piano returned empty output.")
         return None, None
-    # warp_to_piano returns np.zeros_like(frame) on detection failure, not None
+
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     if gray.mean() < 5:
-        print("[calibrate_live] warp returned a blank image — keyboard not detected.")
+        print("[calibrate_live] warp_to_piano returned a blank image.")
         return None, None
-    return warped, corners
 
+    if corners is None:
+        print("[calibrate_live] warp_to_piano did not return corners.")
+        return None, None
+
+    return warped, np.asarray(corners, dtype=np.float32)
 
 def _show_preview(frame: np.ndarray, labeled: np.ndarray) -> str:
     """Show side-by-side preview. Returns 'save', 'retake', or 'abort'."""
@@ -99,11 +198,13 @@ def _show_preview(frame: np.ndarray, labeled: np.ndarray) -> str:
             return "abort"
 
 
-def run(out_path: str, far_side: str, no_preview: bool) -> None:
+def run(out_path: str, far_side: str, no_preview: bool, stream_index: int = 0) -> None:
     while True:
-        print("[calibrate_live] capturing frame from Canon...")
-        frame = _capture_frame()
+        print(f"[calibrate_live] capturing frame from Canon stream {stream_index}...")
+        frame = _capture_frame(stream_index)
         print("[calibrate_live] warping to keyboard...")
+        cv2.imwrite("debug_calibrate_frame.jpg", frame)
+        print("[calibrate_live] wrote debug_calibrate_frame.jpg")
         warped, corners = _try_warp(frame)
 
         if warped is None:
@@ -130,6 +231,17 @@ def run(out_path: str, far_side: str, no_preview: bool) -> None:
         n_white = sum(1 for k in calib["keys"] if k["type"] == "white")
         save_calibration(calib, out_path)
         print(f"[calibrate_live] saved {out_path}")
+
+        # Save matching source frame so validate_calibration.py can find it.
+        out_json = Path(out_path)
+        if out_json.name.endswith("_keys.json"):
+            src_name = out_json.name.replace("_keys.json", ".jpg")
+            src_path = out_json.with_name(src_name)
+        else:
+            src_path = out_json.with_suffix(".jpg")
+
+        cv2.imwrite(str(src_path), frame)
+        print(f"[calibrate_live] saved source frame {src_path}")
         print(f"  {len(calib['keys'])} keys: {n_black} black, {n_white} white")
         print(f"  warp size: {calib['warp']['out_size']}")
         print(f"\nNext step:")
@@ -145,5 +257,7 @@ if __name__ == "__main__":
                    help="which side of the keyboard is camera-far (default: right)")
     p.add_argument("--no-preview", action="store_true",
                    help="skip the confirmation window and save immediately")
+    p.add_argument("--stream", type=int, default=0,
+                   help="which Canon stream to calibrate (0=first, 1=second; default: 0)")
     args = p.parse_args()
-    run(args.out, args.far_side, args.no_preview)
+    run(args.out, args.far_side, args.no_preview, args.stream)
