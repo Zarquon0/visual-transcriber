@@ -164,6 +164,115 @@ class CanonStream():
         self.cap.release()
         self.thread.join(timeout=2.0)
 
+_DUAL_BUFFER_SIZE = 5
+
+class DualCanonStream:
+    """
+    Synchronized stream from two Canon R50 cameras. Each camera runs its own
+    reader thread that fills a rolling buffer of (timestamp, frame) pairs.
+    read() returns the best-matched pair across both buffers.
+    """
+    def __init__(self, src0: int, src1: int, cfg: dict = None, show_stats: bool = False):
+        self._show_stats = show_stats
+
+        if cfg:
+            width = cfg.get("resolution", {}).get("width", DEFAULT_WIDTH)
+            height = cfg.get("resolution", {}).get("height", DEFAULT_HEIGHT)
+            fps = cfg.get("fps")
+        else:
+            width = DEFAULT_WIDTH
+            height = DEFAULT_HEIGHT
+            fps = None
+
+        self._caps: list[cv2.VideoCapture] = []
+        for src in (src0, src1):
+            cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if fps is not None:
+                cap.set(cv2.CAP_PROP_FPS, fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._caps.append(cap)
+
+        self.width = width
+        self.height = height
+
+        # Each buffer stores (timestamp, frame) tuples
+        self._buffers: list[deque[tuple[float, MatLike]]] = [
+            deque(maxlen=_DUAL_BUFFER_SIZE),
+            deque(maxlen=_DUAL_BUFFER_SIZE),
+        ]
+        self._locks = [threading.Lock(), threading.Lock()]
+        self.started = False
+        self._threads: list[threading.Thread] = []
+
+    def start(self):
+        if self.started:
+            return
+        self.started = True
+        for i in range(2):
+            t = threading.Thread(target=self._update, args=(i,), daemon=True)
+            self._threads.append(t)
+            t.start()
+
+    def _update(self, cam_idx: int):
+        cap = self._caps[cam_idx]
+        buf = self._buffers[cam_idx]
+        lock = self._locks[cam_idx]
+        while self.started:
+            grabbed, frame = cap.read()
+            if not grabbed or frame is None:
+                continue
+            if frame.shape[0] != self.height or frame.shape[1] != self.width:
+                frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+            ts = time.perf_counter()
+            with lock:
+                buf.append((ts, frame))
+
+    def read(self) -> tuple[MatLike | None, MatLike | None]:
+        with self._locks[0]:
+            buf0 = list(self._buffers[0])
+        with self._locks[1]:
+            buf1 = list(self._buffers[1])
+
+        if not buf0 or not buf1:
+            return None, None
+
+        ts0, frame0 = buf0[-1]
+        ts1, frame1 = buf1[-1]
+
+        # The older most-recent frame is the reference; find nearest match in the other buffer
+        if ts0 <= ts1:
+            ref_ts, ref_frame = ts0, frame0
+            match_ts, match_frame = min(buf1, key=lambda item: abs(item[0] - ts0))
+            f0, f1 = ref_frame.copy(), match_frame.copy()
+            t0, t1 = ref_ts, match_ts
+        else:
+            ref_ts, ref_frame = ts1, frame1
+            match_ts, match_frame = min(buf0, key=lambda item: abs(item[0] - ts1))
+            f0, f1 = match_frame.copy(), ref_frame.copy()
+            t0, t1 = match_ts, ref_ts
+
+        if self._show_stats:
+            dt_ms = abs(t1 - t0) * 1000
+            for frame, ts in ((f0, t0), (f1, t1)):
+                for i, text in enumerate([f"t={ts:.3f}s", f"dt={dt_ms:.1f}ms"]):
+                    y = 30 + i * 30
+                    cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8, (0, 0, 0), 4, cv2.LINE_AA)
+                    cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+        return f0, f1
+
+    def stop(self):
+        self.started = False
+        for t in self._threads:
+            t.join(timeout=2.0)
+        for cap in self._caps:
+            cap.release()
+
+
 def open_canon_streams(config_path: Path = _CONFIG_PATH, allow_iphone=False, silent = True) -> list[CanonStream]:
     """Detect all Canon cameras and return a list of opened VideoCapture objects.
 
@@ -181,7 +290,7 @@ def open_canon_streams(config_path: Path = _CONFIG_PATH, allow_iphone=False, sil
     cfg = _load_config(config_path)
     streams = []
     for idx in indices:
-        stream = CanonStream(idx, cfg, show_stats=True)
+        stream = CanonStream(idx, cfg, show_stats=False)
         streams.append(stream)
         if not silent:
             print(f"  cam{idx} opened: {stream.cap.isOpened()}")
@@ -189,24 +298,77 @@ def open_canon_streams(config_path: Path = _CONFIG_PATH, allow_iphone=False, sil
     return streams
 
 
+def open_dual_canon_stream(config_path: Path = _CONFIG_PATH, show_stats: bool = False) -> DualCanonStream:
+    """Detect exactly two Canon cameras and return an opened DualCanonStream."""
+    indices = find_canon_indices()
+    if len(indices) < 2:
+        raise RuntimeError(f"Expected 2 Canon cameras, found {len(indices)}")
+    if len(indices) > 2:
+        print(f"Warning: found {len(indices)} Canon cameras, using indices {indices[0]} and {indices[1]}")
+    cfg = _load_config(config_path)
+    return DualCanonStream(indices[0], indices[1], cfg, show_stats=show_stats)
+
+
 if __name__ == "__main__":
-    # DEMO: streams all connected webcams until escaped
-    streams = open_canon_streams(silent=False)
-    
-    for stream in streams: stream.start()
+    stream = open_dual_canon_stream(show_stats=True)
+    stream.start()
+
+    frozen = False
+
     while True:
-        frames = [stream.read() for stream in streams]
-        if not all(ok for ok, _ in frames):
-            print("Failed to read from one or more cameras")
+        if not frozen:
+            f0, f1 = stream.read()
+            if f0 is not None and f1 is not None:
+                cv2.imshow("Canon 0", f0)
+                cv2.imshow("Canon 1", f1)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 32:  # space — freeze on last displayed frames
+            frozen = True
+        elif key == 27:  # ESC — quit
             break
 
-        for i, (_, frame) in enumerate(frames):
-            cv2.imshow(f"cam{i}", frame)
-
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC
-            # NOTE: this doesn't seem to be working at the moment - just ^C twice to quit
-            break
-
-    for stream in streams:
-        stream.stop()
+    stream.stop()
     cv2.destroyAllWindows()
+
+
+# if __name__ == "__main__":
+#     stream = open_dual_canon_stream(show_stats=True)
+#     stream.start()
+
+#     while True:
+#         f0, f1 = stream.read()
+#         if f0 is None or f1 is None:
+#             continue
+
+#         cv2.imshow("Canon 0", f0)
+#         cv2.imshow("Canon 1", f1)
+
+#         if cv2.waitKey(1) & 0xFF == 27:  # ESC
+#             break
+
+#     stream.stop()
+#     cv2.destroyAllWindows()
+
+# if __name__ == "__main__":
+#     # DEMO: streams all connected webcams until escaped
+#     streams = open_canon_streams(silent=False)
+    
+#     for stream in streams: stream.start()
+#     while True:
+#         frames = [stream.read() for stream in streams]
+#         if not all(ok for ok, _ in frames):
+#             print("Failed to read from one or more cameras")
+#             break
+
+#         for i, (_, frame) in enumerate(frames):
+#             cv2.imshow(f"cam{i}", frame)
+
+#         if cv2.waitKey(1) & 0xFF == 27:  # ESC
+#             # NOTE: this doesn't seem to be working at the moment - just ^C twice to quit
+#             break
+
+#     for stream in streams:
+#         stream.stop()
+#     cv2.destroyAllWindows()
+

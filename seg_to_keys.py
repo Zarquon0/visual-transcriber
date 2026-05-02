@@ -60,7 +60,7 @@ def _draw_hist_debug(smoothed: np.ndarray, peak: int) -> np.ndarray:
     cv2.polylines(vis, [pts], False, (200, 200, 200), 1, cv2.LINE_AA)
     px = int(round(peak * (W - 1) / 255))
     cv2.line(vis, (px, pad_t), (px, H - pad_b), (0, 255, 255), 2)
-    label = f'L peak: {peak}  tol: ±{WHITE_PEAK_TOLERANCE}'
+    label = f'L peak: {peak}  tol: {WHITE_PEAK_TOLERANCE}'
     cv2.putText(vis, label, (min(px + 4, W - 180), pad_t + 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(vis, label, (min(px + 4, W - 180), pad_t + 18),
@@ -339,6 +339,16 @@ def warp_key_lines(frame: np.ndarray, line_a: np.ndarray, line_b: np.ndarray, pa
     M = cv2.getPerspectiveTransform(src, dst)
     return M, cv2.warpPerspective(frame, M, (w + 2 * padding, h + 2 * padding))
 
+def white_mass_in_upper_half(img: np.ndarray) -> bool:
+    """Return True if the center of mass of white pixels is in the upper half of img."""
+    mask = isolate_white(img)
+    gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    m = cv2.moments(gray)
+    if m["m00"] == 0:
+        return False
+    cy = m["m01"] / m["m00"]
+    return cy < img.shape[0] / 2
+
 def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
     """
     Takes a more or less top down shot of a piano and warps + crops it to just its keys.
@@ -399,6 +409,12 @@ def warp_to_piano(frame: np.ndarray, debug=False) -> np.ndarray:
     first_rail = np.concatenate([corners[0], corners[1]])
     second_rail = np.concatenate([corners[2], corners[3]])
     warp_trans, warped = warp_key_lines(frame, first_rail, second_rail)
+
+    # if white_mass_in_upper_half(warped):
+    #     corners = [corners[2], corners[3], corners[0], corners[1]]
+    #     first_rail = np.concatenate([corners[0], corners[1]])
+    #     second_rail = np.concatenate([corners[2], corners[3]])
+    #     warp_trans, warped = warp_key_lines(frame, first_rail, second_rail)
 
     if debug:
         H_r, W_r = rot_blob.shape[:2]
@@ -476,10 +492,10 @@ def pics_to_piano(paths: list[str], window_name: str = "keyboard_stream"):
         cv2.imshow(window_name, warped)
         cv2.waitKey(0)
 
-if __name__ == "__main__":
-    streams = open_canon_streams(allow_iphone=True, silent=False)
-    for stream in streams:
-        stream_to_piano(stream)
+# if __name__ == "__main__":
+#     streams = open_canon_streams(allow_iphone=False, silent=False)
+#     for stream in streams:
+#         stream_to_piano(stream)
         
 def load_image(path: str) -> np.ndarray:
     """Load an image by path. Falls back to PIL for formats OpenCV may not
@@ -491,9 +507,9 @@ def load_image(path: str) -> np.ndarray:
 
     return cv2.cvtColor(np.array(Image.open(path).convert("RGB")), cv2.COLOR_RGB2BGR)
 
-# if __name__ == "__main__":
-#     pics_to_piano(sys.argv[1:] if len(sys.argv) > 1 else [
-#         "piano_photos/IMG_9064.jpg",
-#         "piano_photos/IMG_9066.jpg",
-#         "piano_photos/IMG_9073.jpg",
-#     ])
+if __name__ == "__main__":
+    pics_to_piano(sys.argv[1:] if len(sys.argv) > 1 else [
+        "piano_photos/IMG_9064.jpg",
+        "piano_photos/IMG_9066.jpg",
+        "piano_photos/IMG_9073.jpg",
+    ])
