@@ -53,6 +53,8 @@ class KeyDebug:
     release_threshold: float
     safe_delta: float
     front_delta: float
+    back_delta: float
+    front_minus_back: float
     motion_delta: float
 
 
@@ -177,6 +179,8 @@ class PressDetector:
                 release_threshold=float(self._release_thresholds[i]),
                 safe_delta=0.0,
                 front_delta=0.0,
+                back_delta=0.0,
+                front_minus_back=0.0,
                 motion_delta=0.0,
             )
             for i in range(self._n)
@@ -203,7 +207,12 @@ class PressDetector:
     # ---------------------------------------------------------------------
     # Public API
     # ---------------------------------------------------------------------
-    def update(self, warped: np.ndarray) -> list[NoteEvent]:
+    def update(
+        self,
+        warped: np.ndarray,
+        *,
+        candidate_key_indices: set[int] | None = None,
+    ) -> list[NoteEvent]:
         """Update detector with one warped BGR frame and return new events.
 
         Candidate-gated raw mode:
@@ -246,13 +255,17 @@ class PressDetector:
                 raw_scores[ki] = 0.0
                 continue
 
-            score, safe_delta, front_delta, motion_delta = self._score_key(
+            scored = self._score_key(
                 ki,
                 gray,
                 self._last_gray,
                 white_mask=None,
                 global_shift=global_shift,
             )
+            if scored is None:
+                raw_scores[ki] = 0.0
+                continue
+            score, safe_delta, front_delta, motion_delta = scored
 
             raw_scores[ki] = float(score)
             safe_deltas[ki] = float(safe_delta)
@@ -288,6 +301,10 @@ class PressDetector:
         # If a shadow/hand event triggers too many keys, keep only strongest few.
         candidate_indices.sort(key=lambda idx: normalized[idx], reverse=True)
         allowed_new_presses = set(candidate_indices[: self.MAX_NEW_PRESSES_PER_FRAME])
+
+        # Hand gate: restrict new press starts to keys under a fingertip.
+        if candidate_key_indices is not None:
+            allowed_new_presses &= candidate_key_indices
 
         debug_rows: list[KeyDebug] = []
 
@@ -356,6 +373,8 @@ class PressDetector:
                     release_threshold=float(release_thresholds[ki] / press_thresholds[ki]),
                     safe_delta=float(safe_deltas[ki]),
                     front_delta=float(front_deltas[ki]),
+                    back_delta=0.0,
+                    front_minus_back=0.0,
                     motion_delta=float(motion_deltas[ki]),
                 )
             )
@@ -409,9 +428,6 @@ class PressDetector:
         raw_safe = self._safe_masks[key_index]
         raw_front = self._front_masks[key_index]
 
-        # For white keys, restrict measurement to pixels that are visibly white-key
-        # surface (not covered by a hand). If <30% of the safe region is still white,
-        # the hand is occluding the key — return None to signal skip.
         if white_mask is not None and self._keys[key_index].type == "white":
             safe_mask = raw_safe & white_mask
             coverage = safe_mask.sum() / max(1, raw_safe.sum())
@@ -429,9 +445,6 @@ class PressDetector:
         front_baseline = float(self._front_baselines[key_index])
 
         if self._keys[key_index].type == "white":
-            # Global-shift-corrected means: cancel lighting drift common to all keys.
-            # Signed (darkening only): a finger covering the key makes it darker;
-            # specular reflections (brighter than baseline) are NOT a press.
             safe_delta = max(0.0, safe_baseline - (safe_mean - global_shift))
             front_delta = max(0.0, front_baseline - (front_mean - global_shift))
         else:
@@ -454,8 +467,6 @@ class PressDetector:
         return float(score), float(safe_delta), float(front_delta), float(motion_delta)
 
     def _adapt_baseline(self, key_index: int, gray: np.ndarray, global_shift: float = 0.0) -> None:
-        # Adapt toward the global-shift-corrected mean so the baseline stays
-        # anchored to key-surface appearance rather than drifting with lighting.
         safe_mean = self._masked_mean(gray, self._safe_masks[key_index]) - global_shift
         front_mean = self._masked_mean(gray, self._front_masks[key_index]) - global_shift
 
@@ -508,6 +519,36 @@ class PressDetector:
         fy0 = min(max(y0, fy0), y1 - 1)
 
         mask[fy0:y1, x0:x1] = True
+        return mask
+
+    @staticmethod
+    def _make_back_mask(
+        safe_bbox: tuple[int, int, int, int],
+        shape: tuple[int, int],
+        key_type: str,
+    ) -> np.ndarray:
+        """Upper/back band of the safe box — opposite end from the fingertip.
+
+        A real press darkens the front more than the back; a hovering hand
+        or shadow darkens both roughly equally.
+        """
+        h_img, w_img = shape
+        x, y, w, h = [int(v) for v in safe_bbox]
+
+        x0 = max(0, x)
+        x1 = min(w_img, x + w)
+        y0 = max(0, y)
+        y1 = min(h_img, y + h)
+
+        mask = np.zeros(shape, dtype=np.bool_)
+        if x1 <= x0 or y1 <= y0:
+            return mask
+
+        frac = 0.55 if key_type == "white" else 0.45
+        by1 = int(round(y0 + (y1 - y0) * frac))
+        by1 = min(max(y0 + 1, by1), y1)
+
+        mask[y0:by1, x0:x1] = True
         return mask
 
     @staticmethod
