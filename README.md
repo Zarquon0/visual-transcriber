@@ -18,6 +18,9 @@ If one or more video streams are missing, you can try using `cam_probe.py` and `
  
 To change the image resolution or FPS (maybe - not sure FPS control works), alter the values in the `camera_config.yaml` file.
 
+### Synced Dual Canon Camera Streaming
+For synced dual camera streaming, use the DualCanonStream object in `stream_webcams.py`. The `read()` method in the object allows you to read the most recent synced frames from the two cameras. Look to the `if __name__=="__main__":` in `stream_webcams.py` for a usage example.
+
 ### iPhone Continuity Camera
 
 `open_canon_streams()` filter rejects all non Canon camera streams by default, but iPhones can be accepted if the `allow_iphone` flag is passed as `True` to the function.
