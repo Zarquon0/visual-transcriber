@@ -51,8 +51,26 @@ for d in devices {
         (builtin if flag.strip() == "1" else external).append(name.strip())
 
     opencv_order = external + builtin
-    valid_cam_name = (lambda name: "Canon" in name or "iPhone" in name) if allow_iphone else (lambda name: "Canon" in name)
-    return [i for i, name in enumerate(opencv_order) if valid_cam_name(name)]
+    # Prefer "EOS Webcam Utility" (the working video pipe) over "Canon
+    # Digital Camera" (raw still-mode, often crashes on capture). Both
+    # show up when the camera is plugged in via EOS Webcam Utility app.
+    if allow_iphone:
+        is_target = lambda name: "EOS" in name or "Canon" in name or "iPhone" in name
+    else:
+        is_target = lambda name: "EOS" in name or "Canon" in name
+    matches = [(i, name) for i, name in enumerate(opencv_order) if is_target(name)]
+    # Within matches, sort so EOS comes first, then Canon, then iPhone.
+    def rank(name):
+        if "EOS" in name: return 0
+        if "Canon" in name: return 1
+        return 2
+    matches.sort(key=lambda im: rank(im[1]))
+    # Drop "Canon Digital Camera" if "EOS Webcam Utility" is present
+    # (same physical device, only EOS variant works for video).
+    has_eos = any("EOS" in name for _, name in matches)
+    if has_eos:
+        matches = [(i, n) for i, n in matches if "EOS" in n or "iPhone" in n]
+    return [i for i, _ in matches]
 
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720

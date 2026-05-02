@@ -116,6 +116,7 @@ def main():
     warped_path = Path(f"{out_stem}_warped.png")
     labeled_path = Path(f"{out_stem}_labeled.png")
     calib_path = Path(f"{out_stem}_calib.json")
+    keys_path = Path(f"{out_stem}_keys.json")
 
     cv2.imwrite(str(warped_path), warped)
     cv2.imwrite(str(labeled_path), labeled)
@@ -124,7 +125,16 @@ def main():
         "corners_tl_tr_br_bl": corners.tolist(),
     }, indent=2))
 
-    print(f"wrote: {warped_path}\n       {labeled_path}\n       {calib_path}")
+    from calibration import build_calibration_data, save_calibration
+    keys_data = build_calibration_data(
+        warped, corners, far_side="right", camera_id=img_path.stem
+    )
+    save_calibration(keys_data, keys_path)
+
+    print(
+        f"wrote: {warped_path}\n       {labeled_path}\n"
+        f"       {calib_path}\n       {keys_path}"
+    )
 
     # Display result
     stack = np.vstack([warped, labeled])

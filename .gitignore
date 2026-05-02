@@ -15,3 +15,5 @@ batch_result.png
 # NOTE: *_calib.json is NOT ignored — calibration files are reusable per camera mount.
 snapshots/
 piano_photos/_*.png
+recordings/
+/var/folders

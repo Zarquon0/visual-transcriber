@@ -387,6 +387,11 @@ def _detect_blacks_2d(
     # piece's polygon to each inner piece's center. Inner-key polygons
     # thus get the local-region's actual perspective shape, not a global
     # template that may have wrong distortion.
+    # Sliver guard (May 1 fix): drop blobs much narrower than the
+    # observed median. Catches 1-2 px Otsu fragments that the early
+    # max(3, 0.2*expected_bk) filter is too loose to reject.
+    raw = [r for r in raw if r[2] >= 0.4 * median_w]
+
     rects, polys = [], []
     for x_, y_, bw_, bh_, contour in raw:
         if bw_ <= 1.3 * median_w:
