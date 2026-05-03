@@ -31,6 +31,7 @@ import csv
 from record import (
     overlay_from_dict,
     draw_overlay_with_pressed,
+    draw_warp_colored,
 )
 from analyze import (
     skin_mask, channel_brightness, channel_slope, channel_temp_diff,
@@ -93,24 +94,29 @@ def auto_find_chaos_folder(press_folder: Path) -> Path | None:
     return None
 
 
-def compute_rest_mean_frame(rest_folder: Path, det_state: dict) -> np.ndarray | None:
-    """Mean grayscale warped frame over all rest frames — the canonical
-    'unpressed' image that temporal-diff compares against."""
+def compute_rest_mean_frame(rest_folder: Path, det_state: dict):
+    """Mean warped frame over all rest frames — returns (mean_gray, mean_bgr).
+    mean_bgr is used by the shadow-vs-color discriminator in Detector's
+    hand mask. None on failure."""
     try:
         frames = FrameSource(rest_folder)
     except SystemExit:
-        return None
+        return None, None
     M, W, H = det_state["M"], det_state["W"], det_state["H"]
-    accum = np.zeros((H, W), dtype=np.float64)
+    accum_bgr = np.zeros((H, W, 3), dtype=np.float64)
     n = 0
     for i in range(len(frames)):
         bgr = frames.read(i)
         if bgr is None:
             continue
         warped = cv2.warpPerspective(bgr, M, (W, H))
-        accum += cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float64)
+        accum_bgr += warped.astype(np.float64)
         n += 1
-    return (accum / max(1, n)).astype(np.uint8) if n else None
+    if n == 0:
+        return None, None
+    mean_bgr = (accum_bgr / n).astype(np.uint8)
+    mean_gray = cv2.cvtColor(mean_bgr, cv2.COLOR_BGR2GRAY)
+    return mean_gray, mean_bgr
 
 
 def compute_tempdiff_chaos_stats(chaos_folder: Path, det_state: dict,
@@ -365,6 +371,7 @@ def main():
     # Temporal-difference channel: |current_warped - rest_mean_warped|
     # mean per polygon. Simplest possible motion signal.
     rest_mean_frame = None
+    rest_mean_bgr = None
     tempdiff_chaos_mean = None
     tempdiff_chaos_std = None
     if not args.no_tempdiff:
@@ -372,7 +379,7 @@ def main():
         chaos_folder = auto_find_chaos_folder(folder)
         if rest_folder is not None:
             print(f"computing rest mean frame from {rest_folder}...")
-            rest_mean_frame = compute_rest_mean_frame(rest_folder, det_state)
+            rest_mean_frame, rest_mean_bgr = compute_rest_mean_frame(rest_folder, det_state)
             if rest_mean_frame is not None and chaos_folder is not None:
                 print(f"computing tempdiff chaos stats from {chaos_folder}...")
                 tempdiff_chaos_mean, tempdiff_chaos_std = compute_tempdiff_chaos_stats(
@@ -433,7 +440,7 @@ def main():
     # Push computed baselines (from sibling _rest / _chaos folders) into
     # the Detector built earlier.
     if rest_mean_frame is not None:
-        detector.set_rest_mean_frame(rest_mean_frame)
+        detector.set_rest_mean_frame(rest_mean_frame, rest_mean_bgr)
     if bright_baseline is not None:
         detector.set_brightness_baseline(bright_baseline)
     if bright_thresholds is not None:
@@ -480,7 +487,12 @@ def main():
         warped = cv2.warpPerspective(bgr, M, (W, H))
         press_set, line_viz = detector.process(warped)
         last_press_set = press_set
-        cv2.imshow("warp_lines", np.vstack([warped, line_viz]))
+        # Three-panel warp_lines view:
+        #   1) raw warp (top)
+        #   2) filled-color segmentation (middle) — same as record.py warp_cam0
+        #   3) line classification + skin overlay (bottom)
+        segmented_warp = draw_warp_colored(warped, keys_dict)
+        cv2.imshow("warp_lines", np.vstack([warped, segmented_warp, line_viz]))
 
         # Render overlay on the source frame.
         disp = draw_overlay_with_pressed(bgr, polys_src, sbb_src, types, press_set)

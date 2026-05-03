@@ -47,14 +47,15 @@ from analyze import (
 )
 
 
-# Hand-mask tuning constants
-REST_DIFF_T = 20
-MOTION_DIFF_T = 5
+# Hand-mask tuning constants. Mask uses per-pixel **saturation increase**
+# vs the rest baseline (computed in HSV space) as the shadow-vs-hand
+# discriminator: a hand replaces a key pixel with skin, which has higher
+# saturation than the off-white/warm key. A shadow keeps the same key
+# pixel just darker — saturation stays similar. This cleanly separates
+# the two cases without needing color matching to a fixed skin range.
+REST_V_DIFF_T = 20      # |V_curr - V_rest| > this counts as foreground
+SAT_INCREASE_T = 8      # S_curr - S_rest > this means "pixel got more saturated" (hand)
 PERSISTENCE_FRAMES = 12
-SKIN_H_LO1, SKIN_H_HI1 = 0, 30
-SKIN_H_LO2, SKIN_H_HI2 = 165, 180
-SKIN_S_MIN = 40
-SKIN_V_MIN = 50
 MIN_TIGHT_AREA = 100
 MIN_TIGHT_THICKNESS = 4
 GRAD_MIN = 30.0      # filter weak-gradient LSD segments (shadow-like)
@@ -109,6 +110,7 @@ class Detector:
         self._slope_baseline_mean = None
         self._slope_baseline_std = None
         self._rest_mean_frame = None     # warped grayscale, for tempdiff + motion
+        self._rest_mean_bgr = None       # warped BGR, for color-ratio shadow discriminator
         self._tempdiff_chaos_mean = None
         self._tempdiff_chaos_std = None
 
@@ -123,9 +125,13 @@ class Detector:
         """Per-key length-threshold for the line channel (chaos-derived)."""
         self._line_thresholds = thresholds.astype(np.float32)
 
-    def set_rest_mean_frame(self, mean_gray: np.ndarray):
-        """Rest-baseline grayscale image for the warped strip."""
+    def set_rest_mean_frame(self, mean_gray: np.ndarray, mean_bgr: np.ndarray | None = None):
+        """Rest-baseline grayscale image for the warped strip. Optionally
+        also store the BGR rest baseline for the shadow-vs-color
+        discriminator in the hand mask."""
         self._rest_mean_frame = mean_gray
+        if mean_bgr is not None:
+            self._rest_mean_bgr = mean_bgr
 
     def set_brightness_baseline(self, baseline: np.ndarray):
         """Per-key rest-mean intensity (skin-masked)."""
@@ -163,45 +169,41 @@ class Detector:
     # ── Hand mask ────────────────────────────────────────────────────────
 
     def _compute_hand_mask(self, warped_bgr: np.ndarray, warped_gray: np.ndarray):
-        """Motion + HSV color + persistence + blob-filter hand mask."""
-        if self._rest_mean_frame is None or self._prev_gray is None:
+        """HSV-saturation-increase hand mask.
+
+        Per pixel:
+          hand = (V changed significantly) AND (S increased vs rest)
+        A hand replaces a key with skin → saturation jumps up. A shadow
+        keeps the same key, just darker → saturation barely changes. A
+        pressed key shifts intensity slightly with no real saturation
+        change. Only true hand pixels satisfy both conditions.
+        Plus: persistence (keeps held hands masked), connected-component
+        blob filter on tight pixels (kills scattered noise).
+        """
+        if self._rest_mean_frame is None or self._rest_mean_bgr is None:
             return np.zeros(warped_gray.shape, dtype=np.uint8)
-        rest_diff = cv2.absdiff(warped_gray, self._rest_mean_frame)
-        motion_diff = cv2.absdiff(warped_gray, self._prev_gray)
-        motion_mask = (rest_diff > REST_DIFF_T) & (motion_diff > MOTION_DIFF_T)
-        hsv = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
-        h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-        hue_ok = ((h >= SKIN_H_LO1) & (h <= SKIN_H_HI1)) | \
-                 ((h >= SKIN_H_LO2) & (h <= SKIN_H_HI2))
-        static_skin = hue_ok & (s >= SKIN_S_MIN) & (v >= SKIN_V_MIN)
-        seed = motion_mask & static_skin
-        seed_hsv = hsv[seed]
-        if seed_hsv.shape[0] > 200:
-            h_med = float(np.median(seed_hsv[:, 0]))
-            s_med = float(np.median(seed_hsv[:, 1]))
-            v_med = float(np.median(seed_hsv[:, 2]))
-            h_dist = np.minimum(
-                np.abs(h.astype(np.int16) - h_med),
-                180 - np.abs(h.astype(np.int16) - h_med),
-            )
-            adaptive = (
-                (h_dist < 12) &
-                (np.abs(s.astype(np.int16) - s_med) < 40) &
-                (np.abs(v.astype(np.int16) - v_med) < 60)
-            )
-            color_mask = adaptive & static_skin
-        else:
-            color_mask = static_skin
-        foreground = rest_diff > REST_DIFF_T
-        detected = (motion_mask | foreground) & color_mask
+        hsv_curr = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
+        hsv_rest = cv2.cvtColor(self._rest_mean_bgr, cv2.COLOR_BGR2HSV)
+        v_diff = np.abs(
+            hsv_curr[..., 2].astype(np.int16) - hsv_rest[..., 2].astype(np.int16)
+        )
+        sat_increase = (
+            hsv_curr[..., 1].astype(np.int16) - hsv_rest[..., 1].astype(np.int16)
+        )
+        # Strong hand candidate: significant V change AND saturation jumped up.
+        strong_fg = (v_diff > REST_V_DIFF_T) & (sat_increase > SAT_INCREASE_T)
+        # Weak: any V change at all (used during persistence decay).
+        weak_fg = v_diff > REST_V_DIFF_T
         if (self._hand_persistence is None
                 or self._hand_persistence.shape != warped_gray.shape):
             self._hand_persistence = np.zeros(warped_gray.shape, dtype=np.uint8)
-        self._hand_persistence[detected] = PERSISTENCE_FRAMES
-        decay = (~detected) & (self._hand_persistence > 0)
+        self._hand_persistence[strong_fg] = PERSISTENCE_FRAMES
+        decay = (~strong_fg) & (self._hand_persistence > 0)
         self._hand_persistence[decay] -= 1
         recent_hand = self._hand_persistence > 0
-        mask_tight = ((detected | (recent_hand & foreground)).astype(np.uint8) * 255)
+        mask_tight = (
+            (strong_fg | (recent_hand & weak_fg)).astype(np.uint8) * 255
+        )
         # Connected components on dilated mask, filter by tight-pixel shape.
         mask_grouped = cv2.dilate(
             mask_tight, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
@@ -359,6 +361,14 @@ class Detector:
                 cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
             )
             cv2.drawContours(viz, cnts, -1, (255, 0, 255), 2, cv2.LINE_AA)
+        # Polygon outlines so segmentation is visible on the same view.
+        # Black polys = orange-ish thin line, white polys = green-ish thin line.
+        # Drawn FIRST so subsequent LSD segments + skin overlay still read.
+        for ki, mask in enumerate(ov["per_key_mask"]):
+            cnts2, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                         cv2.CHAIN_APPROX_SIMPLE)
+            col = (0, 200, 0) if self.types[ki] == "white" else (0, 100, 200)
+            cv2.drawContours(viz, cnts2, -1, col, 1, cv2.LINE_AA)
 
         g_supp = gray.copy()
         g_supp[skin > 0] = 128
