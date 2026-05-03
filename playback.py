@@ -40,6 +40,53 @@ from analyze import (
 )
 
 
+class FrameSource:
+    """Abstraction over a cam0/ folder of PNGs OR a cam0.mp4 file.
+
+    Teammates who clone the repo get cam0.mp4 (committed) but not raw
+    PNG frames (gitignored — too big). This class falls back to MP4
+    seek-based reading when PNGs aren't available so playback works
+    against either source.
+    """
+
+    def __init__(self, folder: Path, stride: int = 1):
+        cam = folder / "cam0"
+        png_paths = sorted(cam.glob("*.png")) if cam.is_dir() else []
+        if png_paths:
+            self.mode = "png"
+            self.png_paths = png_paths[::stride]
+            self.n = len(self.png_paths)
+            return
+        mp4 = folder / "cam0.mp4"
+        if not mp4.exists():
+            raise SystemExit(
+                f"no cam0/ frames and no cam0.mp4 in {folder} — "
+                "either extract frames or grab the .mp4 via GitHub Releases"
+            )
+        self.mode = "mp4"
+        self.cap = cv2.VideoCapture(str(mp4))
+        if not self.cap.isOpened():
+            raise SystemExit(f"could not open {mp4}")
+        full_n = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.stride = max(1, stride)
+        self.n = full_n // self.stride
+        self._last_idx = -1
+
+    def __len__(self) -> int:
+        return self.n
+
+    def read(self, idx: int) -> np.ndarray | None:
+        if self.mode == "png":
+            return cv2.imread(str(self.png_paths[idx]))
+        target = idx * self.stride
+        # Sequential reads are fast (no seek). Seek only when jumping.
+        if target != self._last_idx + 1:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        ok, frame = self.cap.read()
+        self._last_idx = target if ok else -1
+        return frame if ok else None
+
+
 def auto_find_chaos_folder(press_folder: Path) -> Path | None:
     parent = press_folder.parent
     for cand in parent.glob("*_chaos"):
@@ -51,37 +98,34 @@ def auto_find_chaos_folder(press_folder: Path) -> Path | None:
 def compute_rest_mean_frame(rest_folder: Path, det_state: dict) -> np.ndarray | None:
     """Mean grayscale warped frame over all rest frames — the canonical
     'unpressed' image that temporal-diff compares against."""
-    cam = rest_folder / "cam0"
-    frames = sorted(cam.glob("*.png"))
-    if not frames:
+    try:
+        frames = FrameSource(rest_folder)
+    except SystemExit:
         return None
     M, W, H = det_state["M"], det_state["W"], det_state["H"]
     accum = np.zeros((H, W), dtype=np.float64)
     n = 0
-    for fp in frames:
-        bgr = cv2.imread(str(fp))
+    for i in range(len(frames)):
+        bgr = frames.read(i)
         if bgr is None:
             continue
         warped = cv2.warpPerspective(bgr, M, (W, H))
         accum += cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float64)
         n += 1
-    return (accum / max(1, n)).astype(np.uint8)
+    return (accum / max(1, n)).astype(np.uint8) if n else None
 
 
 def compute_tempdiff_chaos_stats(chaos_folder: Path, det_state: dict,
                                  rest_gray: np.ndarray):
-    """Per-key (mean, std) of temp-diff score over chaos clip frames —
-    measures the noise floor under realistic playing conditions (hands
-    hovering, no presses)."""
-    cam = chaos_folder / "cam0"
-    frames = sorted(cam.glob("*.png"))
-    if not frames:
+    try:
+        frames = FrameSource(chaos_folder)
+    except SystemExit:
         return None, None
     n_keys = len(det_state["per_key_mask"])
     accum = np.full((len(frames), n_keys), np.nan, dtype=np.float32)
     M, W, H = det_state["M"], det_state["W"], det_state["H"]
-    for fi, fp in enumerate(frames):
-        bgr = cv2.imread(str(fp))
+    for fi in range(len(frames)):
+        bgr = frames.read(fi)
         if bgr is None:
             continue
         warped = cv2.warpPerspective(bgr, M, (W, H))
@@ -96,15 +140,15 @@ def compute_tempdiff_chaos_stats(chaos_folder: Path, det_state: dict,
 
 def compute_slope_baseline(rest_folder: Path, det_state: dict):
     """Per-key (mean_angle, std_angle) over all rest frames."""
-    cam = rest_folder / "cam0"
-    frames = sorted(cam.glob("*.png"))
-    if not frames:
+    try:
+        frames = FrameSource(rest_folder)
+    except SystemExit:
         return None, None
     n_keys = len(det_state["per_key_mask"])
     accum = np.full((len(frames), n_keys), np.nan, dtype=np.float32)
     M, W, H = det_state["M"], det_state["W"], det_state["H"]
-    for fi, fp in enumerate(frames):
-        bgr = cv2.imread(str(fp))
+    for fi in range(len(frames)):
+        bgr = frames.read(fi)
         if bgr is None:
             continue
         warped = cv2.warpPerspective(bgr, M, (W, H))
@@ -128,15 +172,15 @@ def auto_find_rest_folder(press_folder: Path) -> Path | None:
 
 def compute_brightness_baseline(rest_folder: Path, det_state: dict) -> np.ndarray | None:
     """Per-key mean intensity over all rest frames (skin-masked)."""
-    cam = rest_folder / "cam0"
-    frames = sorted(cam.glob("*.png"))
-    if not frames:
+    try:
+        frames = FrameSource(rest_folder)
+    except SystemExit:
         return None
     n_keys = len(det_state["per_key_mask"])
     accum = np.zeros((len(frames), n_keys), dtype=np.float32)
     M, W, H = det_state["M"], det_state["W"], det_state["H"]
-    for fi, fp in enumerate(frames):
-        bgr = cv2.imread(str(fp))
+    for fi in range(len(frames)):
+        bgr = frames.read(fi)
         if bgr is None:
             continue
         warped = cv2.warpPerspective(bgr, M, (W, H))
@@ -177,6 +221,8 @@ def diagnose_lines(warped_bgr, det_state, skin):
         yellow = inside polygon but on boundary band (expected, ignored)
         red    = midpoint on skin pixel (suppressed)
         blue   = outside any polygon
+    Skin-masked pixels are also rendered as translucent ORANGE so the
+    user can verify hand coverage frame-by-frame.
     """
     gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
     g_supp = gray.copy()
@@ -184,18 +230,39 @@ def diagnose_lines(warped_bgr, det_state, skin):
     res = _LSD_VIZ.detect(g_supp)
     n_keys = len(det_state["per_key_mask"])
     scores = np.zeros(n_keys, dtype=np.float32)
+    # Start viz with the warped frame, then mark skin pixels: orange
+    # fill at higher alpha + bright magenta contour outline so the mask
+    # boundary is unambiguous frame-by-frame.
     viz = warped_bgr.copy()
+    if skin is not None and np.any(skin):
+        orange = np.zeros_like(viz)
+        orange[skin > 0] = (0, 140, 255)   # BGR — vivid orange
+        viz = cv2.addWeighted(orange, 0.55, viz, 1.0, 0)
+        skin_contours, _ = cv2.findContours(
+            (skin > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(viz, skin_contours, -1, (255, 0, 255), 2, cv2.LINE_AA)
     if res is None or res[0] is None:
         return scores, viz
     lines = res[0].reshape(-1, 4)
     if lines.size == 0:
         return scores, viz
     H, W = det_state["H"], det_state["W"]
+    # Pre-compute gradient magnitude image to filter weak (shadow-like) edges
+    # from strong (real geometric) edges. Threshold of 30 keeps real key
+    # edges (typically 50-150 magnitude) while dropping shadow gradients
+    # (typically <20).
+    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+    GRAD_MIN = 30.0  # tunable; below this is treated as shadow noise
     for x1, y1, x2, y2 in lines:
         mx = int((x1 + x2) * 0.5)
         my = int((y1 + y2) * 0.5)
         if not (0 <= mx < W and 0 <= my < H):
             continue
+        if grad_mag[my, mx] < GRAD_MIN:
+            continue  # weak gradient → likely shadow, ignore entirely
         length = float(np.hypot(x2 - x1, y2 - y1))
         ki = int(det_state["key_id_map"][my, mx])
         on_boundary = bool(det_state["boundary_band"][my, mx] > 0)
@@ -203,7 +270,7 @@ def diagnose_lines(warped_bgr, det_state, skin):
         if on_skin:
             color = (0, 0, 255)        # red
         elif ki < 0:
-            color = (200, 100, 0)      # blue (BGR)
+            color = (200, 100, 0)      # blue
         elif on_boundary:
             color = (0, 220, 220)      # yellow
         else:
@@ -269,7 +336,11 @@ def main():
     ap.add_argument("--debounce", type=int, default=2,
                     help="frames a key must stay above threshold before flagging press")
     ap.add_argument("--no-skin", action="store_true",
-                    help="disable the YCrCb skin mask entirely (test: is mask the bottleneck?)")
+                    help="disable the skin mask entirely (test: is mask the bottleneck?)")
+    ap.add_argument("--simple-skin", action="store_true",
+                    help="use ONLY the original static YCrCb mask from "
+                         "analyze.skin_mask (for A/B comparison vs the new "
+                         "motion+color+persistence approach)")
     ap.add_argument("--rest-baseline", default=None,
                     help="rest folder; if given, replaces YCrCb skin mask with motion mask")
     ap.add_argument("--top-crop", type=int, default=0,
@@ -295,9 +366,9 @@ def main():
     args = ap.parse_args()
 
     folder = Path(args.folder)
-    cam = folder / "cam0"
-    if not cam.is_dir():
-        raise SystemExit(f"missing {cam}")
+    if not folder.is_dir():
+        raise SystemExit(f"missing folder {folder}")
+    # FrameSource will raise if neither cam0/*.png nor cam0.mp4 exists.
 
     keys_path = Path(args.keys) if args.keys else (folder / "cam0_keys.json")
     if not keys_path.exists():
@@ -308,10 +379,10 @@ def main():
     # so the warp + segmentation match the requested crop.
     if args.top_crop > 0:
         from auto_calibrate import calibrate_frame
-        first_frame_path = sorted(cam.glob("*.png"))[0]
-        first_bgr = cv2.imread(str(first_frame_path))
+        _src = FrameSource(folder)
+        first_bgr = _src.read(0)
         if first_bgr is None:
-            raise SystemExit(f"could not read first frame {first_frame_path}")
+            raise SystemExit("could not read first frame for top-crop recalibration")
         res = calibrate_frame(first_bgr, top_crop=args.top_crop, camera_id="playback")
         if res is None:
             print(f"recalibration with top_crop={args.top_crop} failed; using bundled keys.json")
@@ -408,10 +479,8 @@ def main():
         else:
             print("  no _rest sibling folder found; slope channel disabled")
 
-    frames = sorted(cam.glob("*.png"))[::args.stride]
-    if not frames:
-        raise SystemExit(f"no frames in {cam}")
-    print(f"playback: {len(frames)} frames from {folder}")
+    frames = FrameSource(folder, stride=args.stride)
+    print(f"playback: {len(frames)} frames from {folder} (mode={frames.mode})")
     print(f"  speed={args.speed}x  debounce={args.debounce} frames")
     print("  SPACE=pause  -/+=global margin  1/2=black margin -/+  "
           "3/4=white margin -/+  [/]=±1 frame  ,/.=±30 (1s)  </>=±150 (5s)  "
@@ -419,6 +488,15 @@ def main():
 
     snap_dir = Path("recordings/_snapshots")
     snap_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-create both windows at known on-screen positions so they don't
+    # spawn off the visible monitor (e.g. after monitor disconnects).
+    cv2.namedWindow("playback", cv2.WINDOW_NORMAL)
+    cv2.moveWindow("playback", 50, 50)
+    cv2.resizeWindow("playback", 1280, 540)
+    cv2.namedWindow("warp_lines", cv2.WINDOW_NORMAL)
+    cv2.moveWindow("warp_lines", 50, 620)
+    cv2.resizeWindow("warp_lines", 1200, 400)
 
     margin = args.margin
     margin_black = args.margin_black
@@ -432,6 +510,26 @@ def main():
     tempdiff_buf = np.full((SMOOTH_W, n_keys), np.nan, dtype=np.float32)
     buf_idx = 0
     buf_filled = 0
+
+    # Previous-frame gray for motion-based hand mask. None on first frame.
+    prev_gray = None
+    REST_DIFF_T = 20    # |current - rest| > this → "foreground" candidate
+    MOTION_DIFF_T = 5   # |current - prev| > this → "moving" → hand
+    # Persistence map: each pixel that fires the motion+color detector
+    # gets stamped with PERSISTENCE_FRAMES; decrements each frame. Pixels
+    # with persistence>0 stay classified as hand even when motion stops
+    # (e.g., a hand resting on a pressed key), provided they're still
+    # foreground (differ from rest baseline).
+    hand_persistence = None  # initialized lazily once we have warped shape
+    PERSISTENCE_FRAMES = 12
+    # HSV loose-skin range (color side of fusion).
+    # Hand skin is reddish/orange, has nontrivial saturation, and is bright
+    # but not pure-white. Warm-lit white keys are nearly desaturated, so
+    # the saturation floor is the main discriminator.
+    SKIN_H_LO1, SKIN_H_HI1 = 0, 30      # red-orange band
+    SKIN_H_LO2, SKIN_H_HI2 = 165, 180   # wraparound red
+    SKIN_S_MIN = 40                     # white keys typically S<30
+    SKIN_V_MIN = 50                     # exclude deep shadows/black
 
     def recompute_thresholds():
         """Rebuild thresholds array from CSV + current per-type margins."""
@@ -454,17 +552,121 @@ def main():
         if not paused:
             idx = min(idx + 1, len(frames) - 1)
 
-        fp = frames[idx]
-        bgr = cv2.imread(str(fp))
+        bgr = frames.read(idx)
         if bgr is None:
-            print(f"could not read {fp}")
+            print(f"could not read frame {idx}")
             break
 
         # Warp + per-key dual-channel scoring + per-type threshold + debounce.
         M = det_state["M"]
         W, H = det_state["W"], det_state["H"]
         warped = cv2.warpPerspective(bgr, M, (W, H))
-        sk = skin_mask(warped) if not args.no_skin else np.zeros(warped.shape[:2], dtype=np.uint8)
+        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        # Motion-based hand mask: pixels that differ from rest baseline
+        # AND are moving frame-to-frame. Pressed keys are still after
+        # they've dropped, so they pass both tests as NOT-hand. Hands
+        # move continuously, so they get masked. Color-independent.
+        if args.no_skin:
+            sk = np.zeros(warped.shape[:2], dtype=np.uint8)
+        elif args.simple_skin:
+            # A/B comparison: original static YCrCb mask, no motion / no
+            # adaptive color / no persistence / no blob filtering.
+            sk = skin_mask(warped)
+        elif rest_mean_frame is not None and prev_gray is not None:
+            # Motion side: pixels different from rest AND moving frame-to-frame.
+            rest_diff = cv2.absdiff(warped_gray, rest_mean_frame)
+            motion_diff = cv2.absdiff(warped_gray, prev_gray)
+            motion_mask = (rest_diff > REST_DIFF_T) & (motion_diff > MOTION_DIFF_T)
+            hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+            h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+            # ADAPTIVE color side, BOOTSTRAPPED FROM STATIC SKIN GATE only.
+            # Sampling all motion pixels would include moving key-edge
+            # pixels (during a press), poisoning the color range to
+            # eventually cover keys too. Restrict the sample to pixels
+            # that are BOTH moving AND already loosely-skin-colored —
+            # i.e., adapt within the skin space, never outside.
+            hue_ok = ((h >= SKIN_H_LO1) & (h <= SKIN_H_HI1)) | \
+                     ((h >= SKIN_H_LO2) & (h <= SKIN_H_HI2))
+            static_skin = hue_ok & (s >= SKIN_S_MIN) & (v >= SKIN_V_MIN)
+            seed = motion_mask & static_skin
+            seed_hsv = hsv[seed]
+            if seed_hsv.shape[0] > 200:
+                h_med = float(np.median(seed_hsv[:, 0]))
+                s_med = float(np.median(seed_hsv[:, 1]))
+                v_med = float(np.median(seed_hsv[:, 2]))
+                h_tol, s_tol, v_tol = 12.0, 40.0, 60.0
+                h_dist = np.minimum(
+                    np.abs(h.astype(np.int16) - h_med),
+                    180 - np.abs(h.astype(np.int16) - h_med),
+                )
+                # Adaptive range AND-ed with static skin so we never
+                # match outside the skin envelope even if the median
+                # happens to drift.
+                adaptive = (
+                    (h_dist < h_tol) &
+                    (np.abs(s.astype(np.int16) - s_med) < s_tol) &
+                    (np.abs(v.astype(np.int16) - v_med) < v_tol)
+                )
+                color_mask = adaptive & static_skin
+            else:
+                color_mask = static_skin
+            foreground = rest_diff > REST_DIFF_T
+            # Detected = (moving OR foreground-vs-rest) AND skin-colored.
+            # Hand INTERIOR is foreground+skin even when not moving, so
+            # this catches the whole hand body, not just its edges.
+            # Pressed-key shadows are foreground but not skin-colored,
+            # so the color filter rejects them.
+            detected = (motion_mask | foreground) & color_mask
+            if hand_persistence is None or hand_persistence.shape != warped_gray.shape:
+                hand_persistence = np.zeros(warped_gray.shape, dtype=np.uint8)
+            hand_persistence[detected] = PERSISTENCE_FRAMES
+            decay = (~detected) & (hand_persistence > 0)
+            hand_persistence[decay] -= 1
+            recent_hand = hand_persistence > 0
+            mask_tight_bool = detected | (recent_hand & foreground)
+            mask_tight = (mask_tight_bool).astype(np.uint8) * 255
+            # Dilate ONLY for blob grouping (so fingertips merge into a
+            # hand blob), but use the original tight mask for the final
+            # output so we don't bloat past actual hand pixels.
+            mask_grouped = cv2.dilate(
+                mask_tight,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+            )
+            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                mask_grouped, connectivity=8
+            )
+            # Multi-blob filter — per component, evaluate shape on the
+            # TIGHT (pre-dilation) mask, not the dilated one. A thin
+            # press-edge sliver dilates into a fat box that would pass a
+            # naive thickness check; checking tight pixels catches it.
+            MIN_TIGHT_AREA = 100        # pixels of tight mask in this component
+            MIN_TIGHT_THICKNESS = 4     # min(tight_bbox_w, tight_bbox_h)
+            keep = np.zeros(n_labels, dtype=bool)
+            tight_bool = mask_tight > 0
+            for comp_idx in range(1, n_labels):  # 0 is background, skip
+                tight_in_comp = (labels == comp_idx) & tight_bool
+                tight_count = int(tight_in_comp.sum())
+                if tight_count < MIN_TIGHT_AREA:
+                    continue
+                ys, xs = np.where(tight_in_comp)
+                tw = int(xs.max() - xs.min() + 1)
+                th = int(ys.max() - ys.min() + 1)
+                if min(tw, th) < MIN_TIGHT_THICKNESS:
+                    continue
+                keep[comp_idx] = True
+            # Apply the keep-filter to the ORIGINAL tight mask, not the
+            # dilated one — final mask hugs actual hand pixels.
+            keep_mask = keep[labels]
+            sk = np.where(keep_mask & (mask_tight > 0), 255, 0).astype(np.uint8)
+            # Hole-fill: 9px close fills gaps in the hand body (between
+            # fingers, sub-pixel cracks) without bloating outer boundary.
+            sk = cv2.morphologyEx(
+                sk, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
+            )
+        else:
+            sk = np.zeros(warped.shape[:2], dtype=np.uint8)
+        prev_gray = warped_gray.copy()
         # Channel 1: anomalous-line length (visualization included).
         scores, line_viz = diagnose_lines(warped, det_state, sk)
         line_above = scores > thresholds

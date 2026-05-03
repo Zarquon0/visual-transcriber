@@ -128,3 +128,168 @@ To clean up before the press-detection work above is reliable:
 - **Dual-camera capture**: two upper-side-angle cams, one each with `far_side="right"` and `far_side="left"`. Each sees the full keyboard; fusion at the press-event level (above) gives near-side-of-each-cam priority.
 - **Hand occlusion**: the current detection tries to union keyboard-shaped pieces, which helps with small splits. Per-cam redundancy in the fusion step compensates further.
 - **Auto-calibration recovery**: today `_calib.json` files are committed per camera mount. A periodic recalibration step (re-detect corners every few minutes if the camera moves) could remove the manual-clicking step long-term.
+
+
+## Live PoC Pipeline (May 2026)
+
+A live recording + offline playback workflow on top of the existing calibration pipeline. Lets you capture clips, iterate calibration without leaving the live view, and replay-with-detection offline.
+
+### `record.py` — live recorder + iterative calibration
+
+```
+uv run python record.py --cam-index 0 --keys recordings/_snapshots/<latest>_keys.json
+```
+
+Pass `--no-iphone` to exclude iPhone Continuity Camera, or `--cam-index N` to override auto-selection. `--top-crop N` sets the initial top-crop for the warp (default 10 — trims the case-top band that `warp_to_piano` includes by design).
+
+**Hotkeys** (recorder window must be focused):
+
+| Key | Action |
+|---|---|
+| `c` | Calibrate from the current frame in-place. Pops the `warp_cam0` inspector window with the colored polygon overlay and key counts. |
+| `/` `,` `0` | Top-crop +5 / -5 / reset. Each press auto-recalibrates and refreshes the inspector. |
+| `r` / SPACE | Start/stop recording. Frames dump to `recordings/<ts>/cam0/000xxx.png`. On stop, auto-archives (warp + segmented + overlay snapshots + manifest). |
+| `s` | Snapshot a single frame to `recordings/_snapshots/snap_<ts>_cam0.png`. |
+| `o` | Toggle the live-overlay rendering. |
+| `k` | Save the current in-memory calibration to `recordings/_snapshots/calib_<ts>_cam0_keys.json`. |
+| `d` | Toggle live press detection. Pressed keys flash red on the source view, plus a `warp_lines_cam0` window opens showing color-coded LSD segments. |
+| `b` | Capture chaos baseline over 60 frames. Move hands above the keyboard but **don't press any keys** while it captures — this measures the noise floor. |
+| `+` / `-` | Raise/lower the σ threshold for live press detection. |
+| ESC / q | Quit. |
+
+### `auto_calibrate.py` — corner detection + keys.json
+
+In-process and CLI; called from `record.py` on `c` press, also runnable standalone:
+
+```
+uv run python auto_calibrate.py path/to/snap.png [--top-crop N]
+# → writes <stem>_calib.json, <stem>_keys.json, <stem>_warped.png, <stem>_labeled.png
+```
+
+### `playback.py` — replay a recorded clip with detection overlay
+
+```
+uv run python playback.py recordings/<press_folder> \
+    --thresholds recordings/_analysis/<ts>/summary.csv \
+    --margin 1.0 --margin-black 1.5 --margin-white 0.6 \
+    --bright-margin 1.5 --tempdiff-sigma 0.5 \
+    --smooth-window 3 --debounce 1
+```
+
+Reads the recording's bundled `cam0_keys.json` for segmentation and runs the same 4-channel detection from `analyze.py` on each frame, with rolling-mean temporal smoothing. Press-detected keys flash red on the source view; the second window (`warp_lines`) shows every LSD segment color-coded by classification (green = anomalous, yellow = polygon-edge, red = on-skin, blue = outside-polygon) plus a translucent **orange skin-mask fill + magenta contour outline** so you can see exactly which pixels the hand mask covers each frame.
+
+**Hotkeys:**
+
+| Key | Action |
+|---|---|
+| SPACE | Pause/resume |
+| `[` `]` | ±1 frame (auto-pauses) |
+| `,` `.` | ±30 frames (~1 sec) |
+| `<` `>` | ±150 frames (~5 sec) |
+| `0` `9` | Jump to start / end |
+| `+` / `-` | Global threshold margin (multiplies all per-key thresholds) |
+| `1` `2` | Black-key margin -/+ (lower = more sensitive) |
+| `3` `4` | White-key margin -/+ |
+| `s` | Save current frame with overlay |
+| ESC / q | Quit |
+
+**Skin-mask comparison**: pass `--simple-skin` to use the original static YCrCb mask (no motion / no adaptive color / no persistence / no blob filtering) for visual A/B against the new motion+color+persistence approach. Or `--no-skin` to disable masking entirely.
+
+### `analyze.py` — offline 4-channel SNR characterization
+
+```
+uv run python analyze.py recordings/<rest_folder> recordings/<chaos_folder> recordings/<press_folder>
+# → writes recordings/_analysis/<ts>/summary.csv + summary.png + timeseries.png
+```
+
+For each of 61 keys, computes 4 detection channels per frame:
+
+- **Brightness delta** — mean intensity inside polygon (skin-masked), corrected for global illumination shift via median white-key delta. Best for whites where line detection fails.
+- **Anomalous-LSD-line length** — segments inside the polygon AND outside its boundary band. Best for blacks where natural line activity is rich.
+- **Slope (weighted-mean angle)** — average angle of LSD segments per polygon. Tracks tilt of pre-existing lines without depending on absolute brightness.
+- **Temporal difference** — `|current_warped − rest_mean_warped|` mean per polygon, with chaos-noise-floor σ thresholds. The simplest and most robust signal in current state.
+
+Outputs per-key SNR (`(press_max − chaos_mean) / chaos_std`) and a CSV of all channels' max values per phase.
+
+### `archive_recording.py` — bundle a recording
+
+```
+uv run python archive_recording.py recordings/<folder>
+# → writes manifest.md, cam0_warp.png, cam0_segmented.png, cam0_overlay.png
+```
+
+Auto-runs after each `r`-stop in `record.py`.
+
+### Recordings format
+
+Each `recordings/<ts>_<phase>/` folder contains:
+- `cam0/*.png` — raw frames at native resolution (typically 1.4–2 GB; **gitignored**)
+- `cam0.mp4` — H.264 near-lossless (CRF 14) encoding (~25–35 MB; **committed**)
+- `cam0_keys.json` — the calibration applied to this recording
+- `cam0_warp.png`, `cam0_segmented.png`, `cam0_overlay.png` — visualization snapshots
+- `manifest.md` — metadata, frame count, key counts
+
+`playback.py` reads from either source automatically: if the `cam0/*.png` folder is missing or empty, it falls back to `cam0.mp4` via OpenCV's `VideoCapture`. So fresh clones of the repo can run the full pipeline without needing the raw PNGs.
+
+For teammates wanting raw PNG access (e.g., for detection development on lossless frames): tar the `cam0/` folder and attach to a GitHub Release. MP4 is fine for visual inspection but compression artifacts shift LSD line counts by ~10–30% — bit-exact analysis needs PNGs.
+
+### Three committed reference clips
+
+Three labeled phases, all using the same calibration mount:
+
+| Folder | Phase | Duration | What's in it |
+|---|---|---|---|
+| `recordings/1777663774_rest/` | Rest | ~5 s | Empty keyboard, no hands. Used as canonical "rest baseline" for brightness / temp-diff / slope channels. |
+| `recordings/1777663818_chaos/` | Chaos | ~40 s | Hands hovering above keys, casting shadows, fingers near keys but **no presses**. Measures noise floor under realistic playing conditions. |
+| `recordings/1777663914_press/` | Press | ~56 s | Deliberate single-key presses, ~1 sec held each, varied positions across the keyboard. The actual test signal. |
+
+### Quick-start for testing the pipeline (teammates)
+
+After cloning:
+
+```bash
+uv sync   # install dependencies
+```
+
+Then:
+
+```bash
+# 1. Run analyze.py on the three clips → produces per-key SNR + thresholds CSV.
+#    (Requires raw PNGs — only the original capturer has these. Skip if running
+#    on a fresh clone with mp4-only and use the committed analysis below.)
+ls recordings/_analysis/   # any committed analysis run is usable
+
+# 2. Run playback with the latest analysis CSV — works on either PNGs OR mp4.
+uv run python playback.py recordings/1777663914_press \
+    --thresholds recordings/_analysis/1777665677/summary.csv \
+    --margin 1.0 --margin-black 1.5 --margin-white 0.6 \
+    --bright-margin 1.5 --tempdiff-sigma 0.5 \
+    --smooth-window 3 --debounce 1
+```
+
+You should see two windows: the live source view (with red flashes for detected presses) and `warp_lines` (with LSD segments color-coded + orange/magenta hand-mask overlay). Use SPACE to pause, `,/.` to scrub ±1 sec, `1/2/3/4` to tune black/white margins, `+/-` for global threshold.
+
+### Press detection — current state
+
+The 4-channel detector in `playback.py` (and in `record.py`'s `d` mode) uses **per-type channel routing**:
+
+- **Black keys** → `line OR slope OR tempdiff` (brightness omitted; black-key brightness is too noisy under shadows)
+- **White keys** → `brightness OR slope OR tempdiff` (line omitted; white-on-white seams don't reliably fire LSD)
+
+Plus 5-frame rolling-mean smoothing per channel before threshold comparison. Per-key thresholds are loaded from `analyze.py`'s `summary.csv` (`chaos_max × margin × type_margin`).
+
+### **Known limitation: skin masking is not yet reliable**
+
+The current motion-based hand mask in `playback.py` was a successive set of attempts:
+
+1. Static YCrCb (`analyze.py:skin_mask`) — broken on warm-lit white keys (matches whites as skin, leaves hands unmasked).
+2. Motion-only (`|current - rest|` AND `|current - prev|`) — fails when hands stop moving (e.g., on a held press).
+3. Motion + HSV color fusion + adaptive color sampling + 12-frame persistence + connected-component blob filter on tight pixels.
+
+The current state (#3) is an improvement but still bleeds at hand edges and occasionally onto pressed-key boundaries. **Bill's `core/hand_gate.py` on the `visual_detection` branch** uses MediaPipe Hand Landmarker, which sidesteps the color/motion heuristics entirely and is likely the right path forward — port that to main when ready.
+
+### Open issues
+
+- **Hand masking** — see above. Most critical bottleneck for current detection accuracy.
+- **White-key press signal** — LSD doesn't reliably fire on white-on-white seams at this resolution. Front-lip Y-tracking (per-key bottom edge position over time) would be more direct.
+- **Per-key thresholds** from one-off chaos analysis don't transfer perfectly between sessions / lighting; would benefit from per-session chaos baseline (`b` hotkey in `record.py` does this for live mode).

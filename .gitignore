@@ -15,5 +15,9 @@ batch_result.png
 # NOTE: *_calib.json is NOT ignored — calibration files are reusable per camera mount.
 snapshots/
 piano_photos/_*.png
-recordings/
+# Recordings: ignore raw PNG frame folders + loose snapshot clutter,
+# but keep the bundled metadata (mp4, keys.json, manifest, viz pngs)
+# committed so teammates can browse + run detection on the clips.
+recordings/_snapshots/
+recordings/*/cam0/
 /var/folders
