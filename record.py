@@ -201,6 +201,14 @@ def main():
     ap.add_argument("--top-crop", type=int, default=10,
                     help="initial top_crop value (px trimmed off warp top). "
                          "Default 10. Adjust at runtime with /, comma, 0.")
+    ap.add_argument("--hand-gate", action="store_true",
+                    help="gate visual detections with MediaPipe fingertip candidates")
+    ap.add_argument("--hand-neighbors", type=int, default=0,
+                    help="neighbor key expansion for HandGate (default 0)")
+    ap.add_argument("--hand-ttl", type=int, default=5,
+                    help="frames a candidate key stays live after fingertip leaves (default 5)")
+    ap.add_argument("--hands-debug", action="store_true",
+                    help="overlay raw fingertip landmarks and candidate key outlines")
     args = ap.parse_args()
 
     if args.cam_index is not None:
@@ -249,6 +257,7 @@ def main():
     # Live detectors per cam — full 4-channel pipeline shared with playback.
     from detection import Detector
     detectors: dict[int, Detector] = {}
+    hand_gates: dict[int, object] = {}
     # Combined rest+chaos baseline capture state.
     REST_FRAMES = 30
     CHAOS_FRAMES = 60
@@ -264,6 +273,14 @@ def main():
     for ci, p in keys_map.items():
         if ci < len(streams) and p.exists():
             detectors[ci] = Detector(json.loads(p.read_text()))
+            if args.hand_gate:
+                from calibration import Calibration
+                from hand_gate import HandGate
+                hand_gates[ci] = HandGate(
+                    Calibration.load(p),
+                    candidate_ttl_frames=args.hand_ttl,
+                    include_neighbors=args.hand_neighbors,
+                )
 
     print("controls: r/SPACE=record  s=snap  o=overlay  c=calibrate  "
           "/=crop+5  ,=crop-5  0=crop reset  k=save  d=detect  "
@@ -383,7 +400,11 @@ def main():
 
                     # Run detection (will be partial until both baselines captured).
                     pressed, line_viz = detectors[ci].process(warped)
-                    det_press_set[ci] = pressed
+                    if args.hand_gate and ci in hand_gates:
+                        candidate_set = hand_gates[ci].candidate_keys(f)
+                        det_press_set[ci] = pressed & candidate_set
+                    else:
+                        det_press_set[ci] = pressed
                     # HUD on viz: capture status or live detection state.
                     if phase == "rest":
                         msg = f"REST CAPTURE — keep hands away ({bl_remaining[ci]} left)"
@@ -407,6 +428,9 @@ def main():
                     cv2.putText(line_viz, msg, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, col, 1, cv2.LINE_AA)
                     cv2.imshow(f"warp_lines_cam{ci}", np.vstack([warped, line_viz]))
+                    if args.hands_debug and ci in hand_gates:
+                        cv2.imshow(f"hand_warped_debug_cam{ci}",
+                                   hand_gates[ci].draw_warped_debug(warped))
             else:
                 det_press_set = {}
 
@@ -506,6 +530,16 @@ def main():
                     overlays[ci] = overlay_from_dict(keys_dict)
                     pending_keys[ci] = keys_dict
                     detectors[ci] = Detector(keys_dict)
+                    if args.hand_gate:
+                        from calibration import save_calibration, Calibration
+                        from hand_gate import HandGate
+                        tmp = snapshot_dir / f"_tmp_cam{ci}_keys.json"
+                        save_calibration(keys_dict, tmp)
+                        hand_gates[ci] = HandGate(
+                            Calibration.load(tmp),
+                            candidate_ttl_frames=args.hand_ttl,
+                            include_neighbors=args.hand_neighbors,
+                        )
                     print(f"cam{ci} calibrated: {calib_stats(keys_dict)}")
                     # Warp inspector: raw warp on top, colored+numbered overlay below.
                     colored = draw_warp_colored(warped_img, keys_dict)
@@ -536,6 +570,16 @@ def main():
                     overlays[ci] = overlay_from_dict(keys_dict)
                     pending_keys[ci] = keys_dict
                     detectors[ci] = Detector(keys_dict)
+                    if args.hand_gate:
+                        from calibration import save_calibration, Calibration
+                        from hand_gate import HandGate
+                        tmp = snapshot_dir / f"_tmp_cam{ci}_keys.json"
+                        save_calibration(keys_dict, tmp)
+                        hand_gates[ci] = HandGate(
+                            Calibration.load(tmp),
+                            candidate_ttl_frames=args.hand_ttl,
+                            include_neighbors=args.hand_neighbors,
+                        )
                     print(f"cam{ci} (top_crop={top_crop}): {calib_stats(keys_dict)}")
                     colored = draw_warp_colored(warped_img, keys_dict)
                     cv2.imshow(f"warp_cam{ci}", np.vstack([warped_img, colored]))
@@ -602,6 +646,8 @@ def main():
     finally:
         if recording:
             print(f"final: {rec_idx} frames in {rec_dir}")
+        for hg in hand_gates.values():
+            hg.close()
         for s in streams:
             s.stop()
         cv2.destroyAllWindows()

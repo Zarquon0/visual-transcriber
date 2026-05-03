@@ -285,6 +285,16 @@ def main():
                     help="multiplier on B_chaos_max for brightness threshold")
     ap.add_argument("--stride", type=int, default=1, help="frame stride")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed multiplier")
+    ap.add_argument("--hand-gate", action="store_true",
+                    help="intersect visual detections with MediaPipe fingertip candidates")
+    ap.add_argument("--finger-only", action="store_true",
+                    help="show only MediaPipe fingertip candidates (skip visual detector)")
+    ap.add_argument("--hand-neighbors", type=int, default=0,
+                    help="neighbor key expansion for HandGate (default 0)")
+    ap.add_argument("--hand-ttl", type=int, default=5,
+                    help="frames a candidate key stays live after fingertip leaves (default 5)")
+    ap.add_argument("--hands-debug", action="store_true",
+                    help="overlay raw fingertip landmarks and candidate key outlines")
     args = ap.parse_args()
 
     folder = Path(args.folder)
@@ -327,6 +337,16 @@ def main():
     )
     det_state = detector.det_state
     n_keys = len(types)
+
+    hand_gate = None
+    if args.hand_gate or args.finger_only:
+        from calibration import Calibration
+        from hand_gate import HandGate
+        hand_gate = HandGate(
+            Calibration.load(keys_path),
+            candidate_ttl_frames=args.hand_ttl,
+            include_neighbors=args.hand_neighbors,
+        )
 
     # Per-key thresholds from chaos analysis if available; else global default.
     if args.thresholds:
@@ -486,6 +506,12 @@ def main():
         W, H = det_state["W"], det_state["H"]
         warped = cv2.warpPerspective(bgr, M, (W, H))
         press_set, line_viz = detector.process(warped)
+        if hand_gate is not None:
+            candidate_set = hand_gate.candidate_keys(bgr)
+            if args.finger_only:
+                press_set = set(candidate_set)
+            else:
+                press_set = press_set & candidate_set
         last_press_set = press_set
         # Three-panel warp_lines view:
         #   1) raw warp (top)
@@ -493,9 +519,13 @@ def main():
         #   3) line classification + skin overlay (bottom)
         segmented_warp = draw_warp_colored(warped, keys_dict)
         cv2.imshow("warp_lines", np.vstack([warped, segmented_warp, line_viz]))
+        if args.hands_debug and hand_gate is not None:
+            cv2.imshow("hand_warped_debug", hand_gate.draw_warped_debug(warped))
 
         # Render overlay on the source frame.
         disp = draw_overlay_with_pressed(bgr, polys_src, sbb_src, types, press_set)
+        if args.hands_debug and hand_gate is not None:
+            disp = hand_gate.draw(disp, hand_gate._last_raw_tips)
 
         # HUD.
         ph = 540
@@ -585,6 +615,8 @@ def main():
             print(f"end. last_press_set={sorted(last_press_set)}")
             paused = True
 
+    if hand_gate is not None:
+        hand_gate.close()
     cv2.destroyAllWindows()
 
 
