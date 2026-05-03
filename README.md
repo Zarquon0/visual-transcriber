@@ -134,6 +134,70 @@ To clean up before the press-detection work above is reliable:
 
 A live recording + offline playback workflow on top of the existing calibration pipeline. Lets you capture clips, iterate calibration without leaving the live view, and replay-with-detection offline.
 
+> ### ⚠️ Before tuning thresholds, know what's actually wrong
+>
+> The detection pipeline has multiple noise sources that **dominate over** any threshold tuning. Tuning per-key margins helps at the margin (no pun) but doesn't fix the underlying issues:
+>
+> 1. **Hand mask is unreliable.** Current motion+HSV+persistence mask still bleeds onto pressed-key edges and sometimes misses still hands. **MediaPipe-based `core/hand_gate.py` on the `visual_detection` branch** is the right fix.
+> 2. **Shadows can fire detection.** A hand-shadow over a key looks like a brightness drop. Mitigated partially by the LSD gradient floor (drops weak-gradient segments), but soft shadows still cause flicker.
+> 3. **White-key seams have low contrast.** LSD doesn't reliably fire on white-on-white edges. White-key press signal lives mostly in brightness + tempdiff channels, not lines.
+> 4. **General LSD frame-to-frame jitter.** LSD is non-deterministic across small pixel changes. Smoothing window helps but doesn't eliminate flicker.
+>
+> Threshold tuning (`+/-`, `1/2/3/4` hotkeys) is a fine-grained knob, useful AFTER the structural issues are addressed. Don't expect it to compensate for a broken hand mask.
+
+### Quick start — copy-paste commands
+
+**Offline replay of a recorded clip (works on a fresh clone, MP4 fallback):**
+
+```bash
+uv sync
+uv run python playback.py recordings/1777663914_press \
+    --thresholds recordings/_analysis/1777665677/summary.csv \
+    --margin 1.0 --margin-black 1.5 --margin-white 0.6 \
+    --bright-margin 1.5 --tempdiff-sigma 0.5 \
+    --smooth-window 3 --debounce 1
+```
+
+Two windows open: source view with red press flashes + `warp_lines` showing LSD segments and the orange/magenta hand-mask overlay. SPACE pause, `,/.` ±1 sec scrub, `1/2/3/4` per-type margin tuning.
+
+**Live capture + detection from a Canon camera:**
+
+```bash
+uv run python record.py --no-iphone --cam-index 0 \
+    --keys recordings/_snapshots/calib_1777663815_cam0_keys.json
+```
+
+Then in the recorder window:
+1. Press `c` to recalibrate to current camera position. Verify `61 keys (b:25 w:36, labeled:61)` in HUD.
+2. Press `d` to enable detection.
+3. **Hands away from keyboard**, press `b` to start two-phase baseline capture. HUD will say `REST CAPTURE — keep hands away (30 left)`. Wait until it switches to `CHAOS CAPTURE — hover, NO presses (60 left)`. Hover hands over keys without pressing for those frames.
+4. Once HUD says `DETECTING`, the detector is fully populated. Press keys; pressed keys flash red.
+
+### `detection.py` — unified per-frame `Detector` class
+
+The single source of truth for press detection. Used identically by both `record.py` (live `d` mode) and `playback.py` (offline replay). Encapsulates:
+
+- **Hand mask** — motion + HSV color (adaptive within static-skin envelope) + persistence + connected-component blob filter on tight-mask shape + hole fill.
+- **4 channels** — anomalous-LSD-line length, brightness delta vs rest baseline (with global illumination shift correction), weighted-mean line angle z-score, temporal-difference σ vs chaos floor.
+- **Shadow rejection** — LSD gradient-magnitude floor (`GRAD_MIN=30`) drops weak-gradient segments that characterize shadow boundaries.
+- **Per-type fusion** — blacks: `lines OR slope OR tempdiff`; whites: `brightness OR slope OR tempdiff`.
+- **Rolling-mean smoothing** + **temporal debounce** before press fires.
+
+Public API:
+```python
+det = Detector(keys_dict, smooth_window=5, debounce=1, ...)
+det.set_rest_mean_frame(mean_gray)            # for brightness, tempdiff, hand-mask motion side
+det.set_brightness_baseline(per_key_array)
+det.set_brightness_thresholds(per_key_array)
+det.set_slope_baseline(mean_array, std_array)
+det.set_tempdiff_chaos_stats(mean_array, std_array)
+det.set_line_thresholds(per_key_array)
+# per frame:
+pressed_set, line_viz_image = det.process(warped_bgr)
+```
+
+If a baseline isn't set, that channel is silently disabled (`process()` still works on the channels it does have).
+
 ### `record.py` — live recorder + iterative calibration
 
 ```
@@ -153,8 +217,8 @@ Pass `--no-iphone` to exclude iPhone Continuity Camera, or `--cam-index N` to ov
 | `o` | Toggle the live-overlay rendering. |
 | `k` | Save the current in-memory calibration to `recordings/_snapshots/calib_<ts>_cam0_keys.json`. |
 | `d` | Toggle live press detection. Pressed keys flash red on the source view, plus a `warp_lines_cam0` window opens showing color-coded LSD segments. |
-| `b` | Capture chaos baseline over 60 frames. Move hands above the keyboard but **don't press any keys** while it captures — this measures the noise floor. |
-| `+` / `-` | Raise/lower the σ threshold for live press detection. |
+| `b` | **Two-phase baseline capture for live detection.** First 30 frames REST (hands AWAY) → builds rest mean / brightness / slope baselines. Next 60 frames CHAOS (hover, NO presses) → builds line thresholds + tempdiff noise floor. HUD overlay tells you which phase + how many frames left. After both phases the live detector is fully populated. |
+| `+` / `-` | Raise/lower the per-type margins (both blacks and whites). |
 | ESC / q | Quit. |
 
 ### `auto_calibrate.py` — corner detection + keys.json
@@ -193,23 +257,31 @@ Reads the recording's bundled `cam0_keys.json` for segmentation and runs the sam
 | `s` | Save current frame with overlay |
 | ESC / q | Quit |
 
-**Skin-mask comparison**: pass `--simple-skin` to use the original static YCrCb mask (no motion / no adaptive color / no persistence / no blob filtering) for visual A/B against the new motion+color+persistence approach. Or `--no-skin` to disable masking entirely.
+### `analyze.py` — offline characterization (optional)
 
-### `analyze.py` — offline 4-channel SNR characterization
+`analyze.py` is **not required for live detection** — `record.py` captures its own baselines in-session via the `b` hotkey. It's a development / validation tool:
 
 ```
 uv run python analyze.py recordings/<rest_folder> recordings/<chaos_folder> recordings/<press_folder>
 # → writes recordings/_analysis/<ts>/summary.csv + summary.png + timeseries.png
 ```
 
-For each of 61 keys, computes 4 detection channels per frame:
+**What it does:** runs the 4 detection channels on each frame of all three clips and outputs per-key SNR (`(press_max − chaos_mean) / chaos_std`) and a CSV of all channels' max values per phase. Useful for:
 
-- **Brightness delta** — mean intensity inside polygon (skin-masked), corrected for global illumination shift via median white-key delta. Best for whites where line detection fails.
-- **Anomalous-LSD-line length** — segments inside the polygon AND outside its boundary band. Best for blacks where natural line activity is rich.
-- **Slope (weighted-mean angle)** — average angle of LSD segments per polygon. Tracks tilt of pre-existing lines without depending on absolute brightness.
-- **Temporal difference** — `|current_warped − rest_mean_warped|` mean per polygon, with chaos-noise-floor σ thresholds. The simplest and most robust signal in current state.
+- **Validating signal exists**: confirm a press actually produces a measurable channel response (e.g., key 26 white hit 17σ on lines in our reference data).
+- **Generating thresholds for offline replay**: `playback.py --thresholds <CSV>` consumes the line-channel chaos values from this CSV.
+- **Comparing channels**: see which channel works for which key type (drove the per-type fusion design).
 
-Outputs per-key SNR (`(press_max − chaos_mean) / chaos_std`) and a CSV of all channels' max values per phase.
+**You don't need to run analyze.py:**
+- For LIVE — `record.py` captures everything in-session.
+- For replaying the committed reference clips — the committed `recordings/_analysis/1777665677/summary.csv` is already there.
+- Only needed for fresh recordings where you want offline-replay thresholds.
+
+The 4 channels analyze.py computes (also used live by `Detector`):
+- **Brightness delta** — mean intensity inside polygon (skin-masked), global-illumination corrected. Best for whites where lines fail.
+- **Anomalous-LSD-line length** — segments inside polygon AND outside its boundary band. Best for blacks.
+- **Slope (weighted-mean angle)** — average angle of LSD segments per polygon. Tracks tilt of pre-existing lines.
+- **Temporal difference** — `|current − rest_mean|` mean per polygon, σ vs chaos noise floor. Simplest and currently most robust.
 
 ### `archive_recording.py` — bundle a recording
 
@@ -243,40 +315,42 @@ Three labeled phases, all using the same calibration mount:
 | `recordings/1777663818_chaos/` | Chaos | ~40 s | Hands hovering above keys, casting shadows, fingers near keys but **no presses**. Measures noise floor under realistic playing conditions. |
 | `recordings/1777663914_press/` | Press | ~56 s | Deliberate single-key presses, ~1 sec held each, varied positions across the keyboard. The actual test signal. |
 
-### Quick-start for testing the pipeline (teammates)
-
-After cloning:
-
-```bash
-uv sync   # install dependencies
-```
-
-Then:
-
-```bash
-# 1. Run analyze.py on the three clips → produces per-key SNR + thresholds CSV.
-#    (Requires raw PNGs — only the original capturer has these. Skip if running
-#    on a fresh clone with mp4-only and use the committed analysis below.)
-ls recordings/_analysis/   # any committed analysis run is usable
-
-# 2. Run playback with the latest analysis CSV — works on either PNGs OR mp4.
-uv run python playback.py recordings/1777663914_press \
-    --thresholds recordings/_analysis/1777665677/summary.csv \
-    --margin 1.0 --margin-black 1.5 --margin-white 0.6 \
-    --bright-margin 1.5 --tempdiff-sigma 0.5 \
-    --smooth-window 3 --debounce 1
-```
-
-You should see two windows: the live source view (with red flashes for detected presses) and `warp_lines` (with LSD segments color-coded + orange/magenta hand-mask overlay). Use SPACE to pause, `,/.` to scrub ±1 sec, `1/2/3/4` to tune black/white margins, `+/-` for global threshold.
-
 ### Press detection — current state
 
-The 4-channel detector in `playback.py` (and in `record.py`'s `d` mode) uses **per-type channel routing**:
+A single `Detector` class in `detection.py` is the per-frame engine for **both live (`record.py`'s `d` mode) and offline (`playback.py`)**. Identical algorithm in both — improvements propagate automatically.
+
+Per-type channel routing:
 
 - **Black keys** → `line OR slope OR tempdiff` (brightness omitted; black-key brightness is too noisy under shadows)
 - **White keys** → `brightness OR slope OR tempdiff` (line omitted; white-on-white seams don't reliably fire LSD)
 
-Plus 5-frame rolling-mean smoothing per channel before threshold comparison. Per-key thresholds are loaded from `analyze.py`'s `summary.csv` (`chaos_max × margin × type_margin`).
+Plus 5-frame rolling-mean smoothing per channel before threshold comparison + temporal debounce on the fused flag.
+
+**Threshold sources:**
+
+- **Live** (`record.py`): captured in-session via the `b` hotkey's two-phase REST + CHAOS baseline. The `Detector` is incrementally populated — line thresholds from chaos, brightness/slope baselines from rest, tempdiff stats from chaos. Once both phases complete the detector runs at full capability. No dependency on offline analysis.
+- **Offline** (`playback.py`): loaded from `analyze.py`'s `summary.csv` (per-key `chaos_max × margin × type_margin`) for the line channel; rest baselines computed from the sibling `_rest` clip; tempdiff stats from the `_chaos` clip. Useful for replaying a specific recording with detection overlay.
+
+### Threshold tuning controls — what they actually mean
+
+Each per-key score is compared to a **threshold**. If the smoothed score exceeds threshold for `--debounce` frames, that key fires red.
+
+For the LINE channel, the per-key threshold is:
+```
+threshold[k] = chaos_max[k] × global_margin × (margin_black if k is black else margin_white)
+```
+
+| Knob | What it does |
+|---|---|
+| `--margin 1.0` (or `+`/`-` runtime) | Global multiplier on ALL per-key thresholds. Higher → less sensitive overall. |
+| `--margin-black 1.5` (or `2`/`1` runtime) | Multiplier on BLACK-key thresholds only. Black keys have rich natural line activity, usually need higher margin. |
+| `--margin-white 0.6` (or `4`/`3` runtime) | Multiplier on WHITE-key thresholds only. Whites need to be more sensitive (low chaos_max, real press signal can be small). |
+| `--debounce 1` | Frames the score must STAY above threshold before firing. Higher kills brief flickers, slower to detect real presses. |
+| `--smooth-window 3` | Rolling-mean window over per-channel scores. Larger smooths frame-to-frame jitter. |
+| `--bright-margin 1.5` | Threshold multiplier specifically for the brightness channel. |
+| `--tempdiff-sigma 0.5` | σ-floor for the tempdiff channel. Lower fires on smaller pixel deltas. |
+
+**Where threshold tuning helps:** distinguishing borderline presses from borderline noise. **Where it doesn't:** any of the structural issues above (hand mask, shadows, white-on-white contrast). If the underlying signal is buried in those, no threshold combination recovers it.
 
 ### **Known limitation: skin masking is not yet reliable**
 

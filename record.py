@@ -171,34 +171,6 @@ def draw_overlay_with_pressed(frame, polys_src, sbb_src, types, pressed_set):
     return blended
 
 
-def build_detection_state(keys_dict: dict):
-    """Pre-rasterize masks needed for live anomalous-line detection."""
-    from analyze import build_overlays
-    return build_overlays(keys_dict)
-
-
-def detect_pressed(warped_bgr, det_state, threshold: float) -> set[int]:
-    """Run anomalous-LSD-line detection on a warped frame; return key
-    indices whose interior emergent-line length exceeds threshold."""
-    from analyze import skin_mask, channel_lines
-    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
-    sk = skin_mask(warped_bgr)
-    scores = channel_lines(gray, sk, det_state)
-    return {int(i) for i, s in enumerate(scores) if s > threshold}
-
-
-def detect_pressed_with_viz(warped_bgr, det_state, threshold: float):
-    """Same as detect_pressed but also returns the per-segment-classified
-    visualization (green=anomalous, yellow=boundary, red=skin, blue=outside-polys).
-    """
-    from playback import diagnose_lines
-    from analyze import skin_mask
-    sk = skin_mask(warped_bgr)
-    scores, viz = diagnose_lines(warped_bgr, det_state, sk)
-    pressed = {int(i) for i, s in enumerate(scores) if s > threshold}
-    return pressed, viz
-
-
 def open_streams(allow_iphone: bool) -> list[CanonStream]:
     try:
         streams = open_canon_streams(allow_iphone=allow_iphone, silent=False)
@@ -272,24 +244,30 @@ def main():
     # press '/' to crop further or '0' to reset to raw warp.
     top_crop = args.top_crop
     det_enabled = False
-    det_states: dict[int, dict] = {}      # cam_idx → build_detection_state(...)
-    det_n_sigma = 3.0                     # press = score > mean + n_sigma * std
     det_press_set: dict[int, set[int]] = {}
-    det_baseline_mean: dict[int, np.ndarray] = {}
-    det_baseline_std: dict[int, np.ndarray] = {}
-    det_baseline_buf: dict[int, list] = {}
-    det_baseline_capturing: dict[int, int] = {}
-    BASELINE_FRAMES = 60
 
-    # Pre-build detection state for any --keys files supplied at launch,
-    # so 'd' works without needing 'c' first.
+    # Live detectors per cam — full 4-channel pipeline shared with playback.
+    from detection import Detector
+    detectors: dict[int, Detector] = {}
+    # Combined rest+chaos baseline capture state.
+    REST_FRAMES = 30
+    CHAOS_FRAMES = 60
+    bl_phase: dict[int, str] = {}   # cam_idx → "rest" | "chaos" | None
+    bl_remaining: dict[int, int] = {}
+    bl_rest_buf: dict[int, list] = {}
+    bl_chaos_buf: dict[int, list] = {}
+    bl_rest_gray_accum: dict[int, np.ndarray] = {}
+    bl_rest_n: dict[int, int] = {}
+
+    # Pre-build detection state + Detector for any --keys files supplied
+    # at launch, so 'd' works without needing 'c' first.
     for ci, p in keys_map.items():
         if ci < len(streams) and p.exists():
-            det_states[ci] = build_detection_state(json.loads(p.read_text()))
+            detectors[ci] = Detector(json.loads(p.read_text()))
 
     print("controls: r/SPACE=record  s=snap  o=overlay  c=calibrate  "
           "/=crop+5  ,=crop-5  0=crop reset  k=save  d=detect  "
-          "b=chaos baseline (hands hovering, no press)  -/+=n_sigma  ESC=quit")
+          "b=baseline (rest then chaos)  -/+=margins ESC=quit")
     # Pre-create the main preview window at a known on-screen position
     # so it doesn't spawn off the visible monitor (e.g. after monitor
     # changes / disconnects). Other windows (warp_cam0, warp_lines_*)
@@ -311,48 +289,123 @@ def main():
                     cv2.imwrite(str(rec_dir / f"cam{ci}" / f"{rec_idx:06d}.png"), f)
                 rec_idx += 1
 
-            # Per-frame live press detection. Press = score > mean + N·σ
-            # over the captured CHAOS baseline (hands hovering, no presses).
+            # Per-frame live press detection — same Detector class as playback.
+            # Two-phase baseline capture via 'b' hotkey: 30 frames REST
+            # (hands away) then 60 frames CHAOS (hover, no presses).
             if det_enabled:
-                from playback import diagnose_lines
-                from analyze import skin_mask
+                from analyze import (
+                    skin_mask as _ssm,
+                    channel_temp_diff as _ctd,
+                    channel_brightness as _cb,
+                    channel_slope as _cs,
+                    channel_lines as _cl,
+                )
                 for ci, f in enumerate(raw):
-                    if ci not in det_states:
+                    if ci not in detectors:
                         continue
-                    M = det_states[ci]["M"]
-                    W, H = det_states[ci]["W"], det_states[ci]["H"]
+                    M = detectors[ci].det_state["M"]
+                    W, H = detectors[ci].det_state["W"], detectors[ci].det_state["H"]
                     warped = cv2.warpPerspective(f, M, (W, H))
-                    sk = skin_mask(warped)
-                    raw_scores, line_viz = diagnose_lines(warped, det_states[ci], sk)
-                    n = len(raw_scores)
-                    # Capturing chaos baseline?
-                    if det_baseline_capturing.get(ci, 0) > 0:
-                        det_baseline_buf.setdefault(ci, []).append(raw_scores.copy())
-                        det_baseline_capturing[ci] -= 1
-                        if det_baseline_capturing[ci] == 0:
-                            stack = np.stack(det_baseline_buf[ci])
-                            det_baseline_mean[ci] = stack.mean(axis=0)
-                            det_baseline_std[ci] = np.maximum(stack.std(axis=0), 1.0)
-                            print(f"cam{ci} chaos baseline captured "
-                                  f"({len(det_baseline_buf[ci])} frames). "
-                                  f"median mean={np.median(det_baseline_mean[ci]):.1f}, "
-                                  f"median std={np.median(det_baseline_std[ci]):.1f}")
-                            det_baseline_buf[ci] = []
-                    mean = det_baseline_mean.get(ci, np.zeros(n, dtype=np.float32))
-                    std = det_baseline_std.get(ci, np.ones(n, dtype=np.float32))
-                    z = (raw_scores - mean) / std
-                    det_press_set[ci] = {int(i) for i, zi in enumerate(z) if zi > det_n_sigma}
-                    # Annotate viz with capture or detection status.
-                    if det_baseline_capturing.get(ci, 0) > 0:
-                        msg = f"CAPTURING CHAOS BASELINE... {det_baseline_capturing[ci]} frames left"
+                    warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
+                    # Baseline capture in progress?
+                    phase = bl_phase.get(ci)
+                    if phase == "rest":
+                        # Accumulate per-pixel mean of warped gray.
+                        if ci not in bl_rest_gray_accum:
+                            bl_rest_gray_accum[ci] = np.zeros(
+                                warped_gray.shape, dtype=np.float64
+                            )
+                            bl_rest_n[ci] = 0
+                        bl_rest_gray_accum[ci] += warped_gray.astype(np.float64)
+                        bl_rest_n[ci] += 1
+                        # Also collect raw line scores for slope baseline (no skin mask yet).
+                        sk_empty = np.zeros(warped.shape[:2], dtype=np.uint8)
+                        bl_rest_buf.setdefault(ci, []).append({
+                            "bright": _cb(warped_gray, sk_empty, detectors[ci].det_state),
+                            "slope": _cs(warped_gray, sk_empty, detectors[ci].det_state),
+                        })
+                        bl_remaining[ci] -= 1
+                        if bl_remaining[ci] <= 0:
+                            # Finalize rest, transition to chaos.
+                            rest_mean_gray = (
+                                bl_rest_gray_accum[ci] / max(1, bl_rest_n[ci])
+                            ).astype(np.uint8)
+                            detectors[ci].set_rest_mean_frame(rest_mean_gray)
+                            bb = np.array([d["bright"] for d in bl_rest_buf[ci]])
+                            ss = np.array([d["slope"] for d in bl_rest_buf[ci]])
+                            with np.errstate(invalid="ignore"):
+                                detectors[ci].set_brightness_baseline(
+                                    np.nanmean(bb, axis=0)
+                                )
+                                slope_mean = np.nanmean(ss, axis=0)
+                                slope_std = np.maximum(np.nanstd(ss, axis=0), 1.0)
+                            detectors[ci].set_slope_baseline(slope_mean, slope_std)
+                            print(
+                                f"cam{ci} REST captured ({bl_rest_n[ci]} frames). "
+                                f"Now CHAOS phase: hover hands without pressing for "
+                                f"{CHAOS_FRAMES} frames."
+                            )
+                            bl_phase[ci] = "chaos"
+                            bl_remaining[ci] = CHAOS_FRAMES
+                            bl_chaos_buf[ci] = []
+                    elif phase == "chaos":
+                        rest_gray = (
+                            bl_rest_gray_accum[ci] / max(1, bl_rest_n[ci])
+                        ).astype(np.uint8)
+                        sk_chaos = _ssm(warped)
+                        td = _ctd(warped_gray, sk_chaos, detectors[ci].det_state, rest_gray)
+                        ln = _cl(warped_gray, sk_chaos, detectors[ci].det_state)
+                        bl_chaos_buf[ci].append({"td": td, "ln": ln})
+                        bl_remaining[ci] -= 1
+                        if bl_remaining[ci] <= 0:
+                            tds = np.array([d["td"] for d in bl_chaos_buf[ci]])
+                            lns = np.array([d["ln"] for d in bl_chaos_buf[ci]])
+                            with np.errstate(invalid="ignore"):
+                                td_mean = np.nanmean(tds, axis=0)
+                                td_std = np.maximum(np.nanstd(tds, axis=0), 1.0)
+                            ln_max = np.nanmax(lns, axis=0)
+                            detectors[ci].set_tempdiff_chaos_stats(td_mean, td_std)
+                            # Line threshold = chaos_max × 1.0 with floor.
+                            detectors[ci].set_line_thresholds(
+                                np.maximum(ln_max, 5.0).astype(np.float32)
+                            )
+                            # Brightness threshold = global default for now.
+                            detectors[ci].set_brightness_thresholds(
+                                np.full(detectors[ci].n_keys, 10.0, dtype=np.float32)
+                            )
+                            print(
+                                f"cam{ci} CHAOS captured. Detector ready. "
+                                f"line_thr median={np.median(ln_max):.1f}  "
+                                f"tempdiff_chaos_mean median={np.median(td_mean):.1f}"
+                            )
+                            bl_phase[ci] = None
+
+                    # Run detection (will be partial until both baselines captured).
+                    pressed, line_viz = detectors[ci].process(warped)
+                    det_press_set[ci] = pressed
+                    # HUD on viz: capture status or live detection state.
+                    if phase == "rest":
+                        msg = f"REST CAPTURE — keep hands away ({bl_remaining[ci]} left)"
+                        col = (0, 200, 200)
+                    elif phase == "chaos":
+                        msg = f"CHAOS CAPTURE — hover, NO presses ({bl_remaining[ci]} left)"
+                        col = (0, 165, 255)
                     else:
-                        has_baseline = ci in det_baseline_mean
-                        msg = (f"σ-thresh n={det_n_sigma:.1f}  "
-                               f"baseline={'set' if has_baseline else 'NOT set (press b)'}")
-                    cv2.putText(line_viz, msg, (10, 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
-                    cv2.putText(line_viz, msg, (10, 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+                        ready = (
+                            detectors[ci]._line_thresholds is not None
+                            and detectors[ci]._rest_mean_frame is not None
+                        )
+                        msg = (
+                            f"DETECTING — pressed: {sorted(pressed) if pressed else 'none'}"
+                            if ready
+                            else "BASELINES NOT SET — press b"
+                        )
+                        col = (0, 255, 0) if ready else (0, 0, 255)
+                    cv2.putText(line_viz, msg, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (0, 0, 0), 4, cv2.LINE_AA)
+                    cv2.putText(line_viz, msg, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, col, 1, cv2.LINE_AA)
                     cv2.imshow(f"warp_lines_cam{ci}", np.vstack([warped, line_viz]))
             else:
                 det_press_set = {}
@@ -452,7 +505,7 @@ def main():
                     keys_dict, warped_img, _ = res
                     overlays[ci] = overlay_from_dict(keys_dict)
                     pending_keys[ci] = keys_dict
-                    det_states[ci] = build_detection_state(keys_dict)
+                    detectors[ci] = Detector(keys_dict)
                     print(f"cam{ci} calibrated: {calib_stats(keys_dict)}")
                     # Warp inspector: raw warp on top, colored+numbered overlay below.
                     colored = draw_warp_colored(warped_img, keys_dict)
@@ -482,7 +535,7 @@ def main():
                     keys_dict, warped_img, _ = res
                     overlays[ci] = overlay_from_dict(keys_dict)
                     pending_keys[ci] = keys_dict
-                    det_states[ci] = build_detection_state(keys_dict)
+                    detectors[ci] = Detector(keys_dict)
                     print(f"cam{ci} (top_crop={top_crop}): {calib_stats(keys_dict)}")
                     colored = draw_warp_colored(warped_img, keys_dict)
                     cv2.imshow(f"warp_cam{ci}", np.vstack([warped_img, colored]))
@@ -498,30 +551,54 @@ def main():
                         save_calibration(kd, kp)
                         print(f"saved {kp}")
             elif k == ord("d"):
-                if not det_states:
+                if not detectors:
                     print("no detection state — press 'c' or pass --keys first")
                 else:
                     det_enabled = not det_enabled
                     print(f"detect: {det_enabled}  threshold={det_threshold}")
             elif k == ord("b"):
-                # Capture chaos baseline: hover hands above keys, cast
-                # shadows, but DO NOT PRESS. We need realistic noise floor.
-                if not det_states:
-                    print("no detection state — press 'c' first")
+                # Two-phase baseline capture:
+                #   Phase 1 (rest):  30 frames, hands AWAY → rest mean,
+                #                    brightness baseline, slope baseline.
+                #   Phase 2 (chaos): 60 frames, hands HOVERING (no press) →
+                #                    line thresholds, tempdiff chaos stats.
+                if not detectors:
+                    print("no detector — press 'c' first")
                 elif not det_enabled:
-                    print("enable detect with 'd' first, then capture baseline")
+                    print("enable detect with 'd' first, then 'b' to capture baselines")
                 else:
-                    for ci in det_states:
-                        det_baseline_capturing[ci] = BASELINE_FRAMES
-                        det_baseline_buf[ci] = []
-                    print(f"capturing chaos baseline over {BASELINE_FRAMES} frames — "
-                          "MOVE HANDS ABOVE KEYBOARD without pressing any keys")
+                    for ci in detectors:
+                        bl_phase[ci] = "rest"
+                        bl_remaining[ci] = REST_FRAMES
+                        bl_rest_buf[ci] = []
+                        bl_chaos_buf[ci] = []
+                        bl_rest_gray_accum.pop(ci, None)
+                        bl_rest_n.pop(ci, None)
+                    print(
+                        f"BASELINE CAPTURE: REST phase first ({REST_FRAMES} frames, "
+                        f"hands AWAY), then CHAOS phase ({CHAOS_FRAMES} frames, "
+                        "hover but DO NOT PRESS)."
+                    )
             elif k == ord("-") or k == ord("_"):
-                det_n_sigma = max(0.5, det_n_sigma - 0.5)
-                print(f"n_sigma: {det_n_sigma}")
+                for det in detectors.values():
+                    det.set_margin_black(max(0.1, det.margin_black - 0.1))
+                    det.set_margin_white(max(0.1, det.margin_white - 0.1))
+                med = next(iter(detectors.values()), None)
+                if med is not None:
+                    print(
+                        f"black margin: {med.margin_black:.2f}, "
+                        f"white margin: {med.margin_white:.2f}"
+                    )
             elif k == ord("=") or k == ord("+"):
-                det_n_sigma += 0.5
-                print(f"n_sigma: {det_n_sigma}")
+                for det in detectors.values():
+                    det.set_margin_black(det.margin_black + 0.1)
+                    det.set_margin_white(det.margin_white + 0.1)
+                med = next(iter(detectors.values()), None)
+                if med is not None:
+                    print(
+                        f"black margin: {med.margin_black:.2f}, "
+                        f"white margin: {med.margin_white:.2f}"
+                    )
     finally:
         if recording:
             print(f"final: {rec_idx} frames in {rec_dir}")

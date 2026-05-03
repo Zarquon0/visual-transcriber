@@ -30,14 +30,12 @@ import numpy as np
 import csv
 from record import (
     overlay_from_dict,
-    draw_overlay,
     draw_overlay_with_pressed,
-    build_detection_state,
 )
 from analyze import (
-    skin_mask, channel_lines, channel_brightness, channel_slope,
-    channel_temp_diff, apply_global_shift,
+    skin_mask, channel_brightness, channel_slope, channel_temp_diff,
 )
+from detection import Detector
 
 
 class FrameSource:
@@ -211,75 +209,6 @@ def load_brightness_thresholds(csv_path: Path, n_keys: int, margin: float) -> np
     return np.maximum(raw * margin, 1.0)
 
 
-_LSD_VIZ = cv2.createLineSegmentDetector()
-
-
-def diagnose_lines(warped_bgr, det_state, skin):
-    """Return (per_key_score, viz_image) where viz shows EVERY LSD segment
-    color-coded by its classification:
-        green  = interior emergent (counts as anomalous toward a key)
-        yellow = inside polygon but on boundary band (expected, ignored)
-        red    = midpoint on skin pixel (suppressed)
-        blue   = outside any polygon
-    Skin-masked pixels are also rendered as translucent ORANGE so the
-    user can verify hand coverage frame-by-frame.
-    """
-    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
-    g_supp = gray.copy()
-    g_supp[skin > 0] = 128
-    res = _LSD_VIZ.detect(g_supp)
-    n_keys = len(det_state["per_key_mask"])
-    scores = np.zeros(n_keys, dtype=np.float32)
-    # Start viz with the warped frame, then mark skin pixels: orange
-    # fill at higher alpha + bright magenta contour outline so the mask
-    # boundary is unambiguous frame-by-frame.
-    viz = warped_bgr.copy()
-    if skin is not None and np.any(skin):
-        orange = np.zeros_like(viz)
-        orange[skin > 0] = (0, 140, 255)   # BGR — vivid orange
-        viz = cv2.addWeighted(orange, 0.55, viz, 1.0, 0)
-        skin_contours, _ = cv2.findContours(
-            (skin > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        cv2.drawContours(viz, skin_contours, -1, (255, 0, 255), 2, cv2.LINE_AA)
-    if res is None or res[0] is None:
-        return scores, viz
-    lines = res[0].reshape(-1, 4)
-    if lines.size == 0:
-        return scores, viz
-    H, W = det_state["H"], det_state["W"]
-    # Pre-compute gradient magnitude image to filter weak (shadow-like) edges
-    # from strong (real geometric) edges. Threshold of 30 keeps real key
-    # edges (typically 50-150 magnitude) while dropping shadow gradients
-    # (typically <20).
-    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
-    GRAD_MIN = 30.0  # tunable; below this is treated as shadow noise
-    for x1, y1, x2, y2 in lines:
-        mx = int((x1 + x2) * 0.5)
-        my = int((y1 + y2) * 0.5)
-        if not (0 <= mx < W and 0 <= my < H):
-            continue
-        if grad_mag[my, mx] < GRAD_MIN:
-            continue  # weak gradient → likely shadow, ignore entirely
-        length = float(np.hypot(x2 - x1, y2 - y1))
-        ki = int(det_state["key_id_map"][my, mx])
-        on_boundary = bool(det_state["boundary_band"][my, mx] > 0)
-        on_skin = bool(skin[my, mx] > 0)
-        if on_skin:
-            color = (0, 0, 255)        # red
-        elif ki < 0:
-            color = (200, 100, 0)      # blue
-        elif on_boundary:
-            color = (0, 220, 220)      # yellow
-        else:
-            color = (0, 255, 0)        # green — counts!
-            scores[ki] += length
-        cv2.line(viz, (int(x1), int(y1)), (int(x2), int(y2)), color, 1, cv2.LINE_AA)
-    return scores, viz
-
-
 def load_per_key_thresholds(csv_path: Path, n_keys: int, margin: float = 1.2):
     """Read summary.csv and return per-key threshold = chaos_max * margin
     (or rest_max if larger). Returns array length n_keys.
@@ -315,13 +244,6 @@ def load_per_key_thresholds(csv_path: Path, n_keys: int, margin: float = 1.2):
     return thr.astype(np.float32)
 
 
-def detect_pressed_per_key(warped_bgr, det_state, thresholds: np.ndarray) -> set[int]:
-    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
-    sk = skin_mask(warped_bgr)
-    scores = channel_lines(gray, sk, det_state)
-    return {int(i) for i, s in enumerate(scores) if s > thresholds[i]}
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder", help="recording folder (must contain cam0/)")
@@ -335,12 +257,6 @@ def main():
                     help="multiplier on chaos_max when loading per-key thresholds")
     ap.add_argument("--debounce", type=int, default=2,
                     help="frames a key must stay above threshold before flagging press")
-    ap.add_argument("--no-skin", action="store_true",
-                    help="disable the skin mask entirely (test: is mask the bottleneck?)")
-    ap.add_argument("--simple-skin", action="store_true",
-                    help="use ONLY the original static YCrCb mask from "
-                         "analyze.skin_mask (for A/B comparison vs the new "
-                         "motion+color+persistence approach)")
     ap.add_argument("--rest-baseline", default=None,
                     help="rest folder; if given, replaces YCrCb skin mask with motion mask")
     ap.add_argument("--top-crop", type=int, default=0,
@@ -391,7 +307,19 @@ def main():
             print(f"recalibrated from frame 0 with top_crop={args.top_crop}: "
                   f"{len(keys_dict['keys'])} keys")
     polys_src, sbb_src, types = overlay_from_dict(keys_dict)
-    det_state = build_detection_state(keys_dict)
+    # Build Detector early so we use ITS det_state everywhere (single
+    # source of truth — same masks/keys are used by baselines and live
+    # processing). The Detector constructor builds the overlay state.
+    detector = Detector(
+        keys_dict,
+        smooth_window=max(1, args.smooth_window),
+        debounce=max(1, args.debounce),
+        slope_n_sigma=4.0,
+        tempdiff_n_sigma=args.tempdiff_sigma,
+        margin_black=args.margin_black,
+        margin_white=args.margin_white,
+    )
+    det_state = detector.det_state
     n_keys = len(types)
 
     # Per-key thresholds from chaos analysis if available; else global default.
@@ -502,43 +430,32 @@ def main():
     margin_black = args.margin_black
     margin_white = args.margin_white
 
-    # Rolling-window buffers per channel: (smooth_window, n_keys) ring.
-    SMOOTH_W = max(1, args.smooth_window)
-    line_buf = np.zeros((SMOOTH_W, n_keys), dtype=np.float32)
-    bright_buf = np.full((SMOOTH_W, n_keys), np.nan, dtype=np.float32)
-    slope_buf = np.full((SMOOTH_W, n_keys), np.nan, dtype=np.float32)
-    tempdiff_buf = np.full((SMOOTH_W, n_keys), np.nan, dtype=np.float32)
-    buf_idx = 0
-    buf_filled = 0
-
-    # Previous-frame gray for motion-based hand mask. None on first frame.
-    prev_gray = None
-    REST_DIFF_T = 20    # |current - rest| > this → "foreground" candidate
-    MOTION_DIFF_T = 5   # |current - prev| > this → "moving" → hand
-    # Persistence map: each pixel that fires the motion+color detector
-    # gets stamped with PERSISTENCE_FRAMES; decrements each frame. Pixels
-    # with persistence>0 stay classified as hand even when motion stops
-    # (e.g., a hand resting on a pressed key), provided they're still
-    # foreground (differ from rest baseline).
-    hand_persistence = None  # initialized lazily once we have warped shape
-    PERSISTENCE_FRAMES = 12
-    # HSV loose-skin range (color side of fusion).
-    # Hand skin is reddish/orange, has nontrivial saturation, and is bright
-    # but not pure-white. Warm-lit white keys are nearly desaturated, so
-    # the saturation floor is the main discriminator.
-    SKIN_H_LO1, SKIN_H_HI1 = 0, 30      # red-orange band
-    SKIN_H_LO2, SKIN_H_HI2 = 165, 180   # wraparound red
-    SKIN_S_MIN = 40                     # white keys typically S<30
-    SKIN_V_MIN = 50                     # exclude deep shadows/black
+    # Push computed baselines (from sibling _rest / _chaos folders) into
+    # the Detector built earlier.
+    if rest_mean_frame is not None:
+        detector.set_rest_mean_frame(rest_mean_frame)
+    if bright_baseline is not None:
+        detector.set_brightness_baseline(bright_baseline)
+    if bright_thresholds is not None:
+        detector.set_brightness_thresholds(bright_thresholds)
+    if slope_baseline_mean is not None and slope_baseline_std is not None:
+        detector.set_slope_baseline(slope_baseline_mean, slope_baseline_std)
+    if tempdiff_chaos_mean is not None and tempdiff_chaos_std is not None:
+        detector.set_tempdiff_chaos_stats(tempdiff_chaos_mean, tempdiff_chaos_std)
 
     def recompute_thresholds():
-        """Rebuild thresholds array from CSV + current per-type margins."""
+        """Rebuild thresholds array from CSV + current per-type margins,
+        push into detector."""
         if not args.thresholds:
-            return np.full(n_keys, args.threshold, dtype=np.float32)
-        base = load_per_key_thresholds(Path(args.thresholds), n_keys, margin)
-        for i, t in enumerate(types):
-            base[i] *= (margin_black if t == "black" else margin_white)
-        return base
+            thr = np.full(n_keys, args.threshold, dtype=np.float32)
+        else:
+            thr = load_per_key_thresholds(Path(args.thresholds), n_keys, margin)
+            for i, t in enumerate(types):
+                thr[i] *= (margin_black if t == "black" else margin_white)
+        detector.set_line_thresholds(thr)
+        detector.set_margin_black(margin_black)
+        detector.set_margin_white(margin_white)
+        return thr
 
     thresholds = recompute_thresholds()
     paused = False
@@ -557,206 +474,13 @@ def main():
             print(f"could not read frame {idx}")
             break
 
-        # Warp + per-key dual-channel scoring + per-type threshold + debounce.
+        # Single unified detection: same Detector class as live mode.
         M = det_state["M"]
         W, H = det_state["W"], det_state["H"]
         warped = cv2.warpPerspective(bgr, M, (W, H))
-        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        # Motion-based hand mask: pixels that differ from rest baseline
-        # AND are moving frame-to-frame. Pressed keys are still after
-        # they've dropped, so they pass both tests as NOT-hand. Hands
-        # move continuously, so they get masked. Color-independent.
-        if args.no_skin:
-            sk = np.zeros(warped.shape[:2], dtype=np.uint8)
-        elif args.simple_skin:
-            # A/B comparison: original static YCrCb mask, no motion / no
-            # adaptive color / no persistence / no blob filtering.
-            sk = skin_mask(warped)
-        elif rest_mean_frame is not None and prev_gray is not None:
-            # Motion side: pixels different from rest AND moving frame-to-frame.
-            rest_diff = cv2.absdiff(warped_gray, rest_mean_frame)
-            motion_diff = cv2.absdiff(warped_gray, prev_gray)
-            motion_mask = (rest_diff > REST_DIFF_T) & (motion_diff > MOTION_DIFF_T)
-            hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-            h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-            # ADAPTIVE color side, BOOTSTRAPPED FROM STATIC SKIN GATE only.
-            # Sampling all motion pixels would include moving key-edge
-            # pixels (during a press), poisoning the color range to
-            # eventually cover keys too. Restrict the sample to pixels
-            # that are BOTH moving AND already loosely-skin-colored —
-            # i.e., adapt within the skin space, never outside.
-            hue_ok = ((h >= SKIN_H_LO1) & (h <= SKIN_H_HI1)) | \
-                     ((h >= SKIN_H_LO2) & (h <= SKIN_H_HI2))
-            static_skin = hue_ok & (s >= SKIN_S_MIN) & (v >= SKIN_V_MIN)
-            seed = motion_mask & static_skin
-            seed_hsv = hsv[seed]
-            if seed_hsv.shape[0] > 200:
-                h_med = float(np.median(seed_hsv[:, 0]))
-                s_med = float(np.median(seed_hsv[:, 1]))
-                v_med = float(np.median(seed_hsv[:, 2]))
-                h_tol, s_tol, v_tol = 12.0, 40.0, 60.0
-                h_dist = np.minimum(
-                    np.abs(h.astype(np.int16) - h_med),
-                    180 - np.abs(h.astype(np.int16) - h_med),
-                )
-                # Adaptive range AND-ed with static skin so we never
-                # match outside the skin envelope even if the median
-                # happens to drift.
-                adaptive = (
-                    (h_dist < h_tol) &
-                    (np.abs(s.astype(np.int16) - s_med) < s_tol) &
-                    (np.abs(v.astype(np.int16) - v_med) < v_tol)
-                )
-                color_mask = adaptive & static_skin
-            else:
-                color_mask = static_skin
-            foreground = rest_diff > REST_DIFF_T
-            # Detected = (moving OR foreground-vs-rest) AND skin-colored.
-            # Hand INTERIOR is foreground+skin even when not moving, so
-            # this catches the whole hand body, not just its edges.
-            # Pressed-key shadows are foreground but not skin-colored,
-            # so the color filter rejects them.
-            detected = (motion_mask | foreground) & color_mask
-            if hand_persistence is None or hand_persistence.shape != warped_gray.shape:
-                hand_persistence = np.zeros(warped_gray.shape, dtype=np.uint8)
-            hand_persistence[detected] = PERSISTENCE_FRAMES
-            decay = (~detected) & (hand_persistence > 0)
-            hand_persistence[decay] -= 1
-            recent_hand = hand_persistence > 0
-            mask_tight_bool = detected | (recent_hand & foreground)
-            mask_tight = (mask_tight_bool).astype(np.uint8) * 255
-            # Dilate ONLY for blob grouping (so fingertips merge into a
-            # hand blob), but use the original tight mask for the final
-            # output so we don't bloat past actual hand pixels.
-            mask_grouped = cv2.dilate(
-                mask_tight,
-                cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
-            )
-            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-                mask_grouped, connectivity=8
-            )
-            # Multi-blob filter — per component, evaluate shape on the
-            # TIGHT (pre-dilation) mask, not the dilated one. A thin
-            # press-edge sliver dilates into a fat box that would pass a
-            # naive thickness check; checking tight pixels catches it.
-            MIN_TIGHT_AREA = 100        # pixels of tight mask in this component
-            MIN_TIGHT_THICKNESS = 4     # min(tight_bbox_w, tight_bbox_h)
-            keep = np.zeros(n_labels, dtype=bool)
-            tight_bool = mask_tight > 0
-            for comp_idx in range(1, n_labels):  # 0 is background, skip
-                tight_in_comp = (labels == comp_idx) & tight_bool
-                tight_count = int(tight_in_comp.sum())
-                if tight_count < MIN_TIGHT_AREA:
-                    continue
-                ys, xs = np.where(tight_in_comp)
-                tw = int(xs.max() - xs.min() + 1)
-                th = int(ys.max() - ys.min() + 1)
-                if min(tw, th) < MIN_TIGHT_THICKNESS:
-                    continue
-                keep[comp_idx] = True
-            # Apply the keep-filter to the ORIGINAL tight mask, not the
-            # dilated one — final mask hugs actual hand pixels.
-            keep_mask = keep[labels]
-            sk = np.where(keep_mask & (mask_tight > 0), 255, 0).astype(np.uint8)
-            # Hole-fill: 9px close fills gaps in the hand body (between
-            # fingers, sub-pixel cracks) without bloating outer boundary.
-            sk = cv2.morphologyEx(
-                sk, cv2.MORPH_CLOSE,
-                cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
-            )
-        else:
-            sk = np.zeros(warped.shape[:2], dtype=np.uint8)
-        prev_gray = warped_gray.copy()
-        # Channel 1: anomalous-line length (visualization included).
-        scores, line_viz = diagnose_lines(warped, det_state, sk)
-        line_above = scores > thresholds
-        # Channel 2: brightness delta from rest baseline, with global shift.
-        bright_above = np.zeros(n_keys, dtype=bool)
-        if bright_baseline is not None and bright_thresholds is not None:
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            cur_b = channel_brightness(gray, sk, det_state)
-            delta = cur_b - bright_baseline
-            white_idx_arr = np.array([i for i, t in enumerate(types) if t == "white"])
-            if len(white_idx_arr) > 0:
-                wd = delta[white_idx_arr]
-                if not np.all(np.isnan(wd)):
-                    shift = float(np.nanmedian(wd))
-                    if not np.isnan(shift):
-                        delta = delta - shift
-            with np.errstate(invalid="ignore"):
-                ba = np.abs(delta) > bright_thresholds
-            bright_above = np.where(np.isnan(delta), False, ba).astype(bool)
-        # Channel 3: slope (angle) deviation from rest baseline.
-        slope_z = np.full(n_keys, np.nan, dtype=np.float32)
-        if slope_baseline_mean is not None:
-            gray2 = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            cur_slope = channel_slope(gray2, sk, det_state)
-            slope_delta = cur_slope - slope_baseline_mean
-            slope_delta = ((slope_delta + 90.0) % 180.0) - 90.0
-            with np.errstate(invalid="ignore"):
-                slope_z = np.abs(slope_delta) / np.maximum(slope_baseline_std, 1.0)
-        # Channel 4: temporal-difference vs rest mean frame.
-        tempdiff_z = np.full(n_keys, np.nan, dtype=np.float32)
-        if rest_mean_frame is not None:
-            gray3 = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            cur_td = channel_temp_diff(gray3, sk, det_state, rest_mean_frame)
-            if tempdiff_chaos_mean is not None and tempdiff_chaos_std is not None:
-                with np.errstate(invalid="ignore"):
-                    tempdiff_z = (cur_td - tempdiff_chaos_mean) / np.maximum(
-                        tempdiff_chaos_std, 1.0
-                    )
-            else:
-                # Fallback if no chaos data: just use current value as score.
-                tempdiff_z = cur_td
-
-        # ── Roll into smoothing buffers ─────────────────────────────────
-        line_buf[buf_idx] = scores
-        bright_buf[buf_idx] = (line_above.astype(float))  # not used; kept for shape
-        # store actual delta for brightness for smoothing:
-        if bright_baseline is not None and bright_thresholds is not None:
-            bright_buf[buf_idx] = np.abs(delta) - bright_thresholds  # signed: >0 means above
-        slope_buf[buf_idx] = slope_z
-        tempdiff_buf[buf_idx] = tempdiff_z
-        buf_idx = (buf_idx + 1) % SMOOTH_W
-        buf_filled = min(buf_filled + 1, SMOOTH_W)
-
-        # ── Smoothed (rolling-mean) per-channel above-threshold flags ───
-        with np.errstate(invalid="ignore"):
-            line_smoothed = np.nanmean(line_buf[:buf_filled], axis=0)
-            bright_smoothed = np.nanmean(bright_buf[:buf_filled], axis=0)
-            slope_smoothed = np.nanmean(slope_buf[:buf_filled], axis=0)
-            tempdiff_smoothed = np.nanmean(tempdiff_buf[:buf_filled], axis=0)
-        line_above_s = line_smoothed > thresholds
-        bright_above_s = np.where(np.isnan(bright_smoothed), False,
-                                  bright_smoothed > 0).astype(bool)
-        slope_above_s = np.where(np.isnan(slope_smoothed), False,
-                                 slope_smoothed > slope_n_sigma).astype(bool)
-        tempdiff_above_s = np.where(np.isnan(tempdiff_smoothed), False,
-                                    tempdiff_smoothed > args.tempdiff_sigma).astype(bool)
-
-        # Per-type fusion: blacks use line+slope+tempdiff;
-        # whites use brightness+slope+tempdiff.
-        is_black = np.array([t == "black" for t in types])
-        above = np.where(
-            is_black,
-            line_above_s | slope_above_s | tempdiff_above_s,
-            bright_above_s | slope_above_s | tempdiff_above_s,
-        )
-        above_count = np.where(above, above_count + 1, 0)
-        press_set = {int(i) for i, c in enumerate(above_count) if c >= args.debounce}
+        press_set, line_viz = detector.process(warped)
         last_press_set = press_set
-        # Always update the line-diagnosis window (cheap, very useful).
-        # Stack: warped bgr top, classified-line viz below.
-        diag = np.vstack([warped, line_viz])
-        # Annotate top-line scores so we can see which keys are firing.
-        if press_set:
-            ki_top = max(press_set, key=lambda k: scores[k])
-            txt = f"top-press key {ki_top}: score={scores[ki_top]:.0f}  thr={thresholds[ki_top]:.0f}"
-            cv2.putText(diag, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(diag, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.imshow("warp_lines", diag)
+        cv2.imshow("warp_lines", np.vstack([warped, line_viz]))
 
         # Render overlay on the source frame.
         disp = draw_overlay_with_pressed(bgr, polys_src, sbb_src, types, press_set)
