@@ -277,6 +277,10 @@ def main():
                     help="disable slope-change channel")
     ap.add_argument("--no-tempdiff", action="store_true",
                     help="disable temporal-difference channel")
+    ap.add_argument("--mediapipe", action="store_true",
+                    help="use MediaPipe Hands for the hand mask (color-independent, "
+                         "robust to skin tone). Falls back to saturation-increase "
+                         "heuristic if MediaPipe doesn't detect hands in a frame.")
     ap.add_argument("--tempdiff-sigma", type=float, default=4.0,
                     help="press = temp_diff > chaos_mean + N*chaos_std (default 4)")
     ap.add_argument("--smooth-window", type=int, default=5,
@@ -334,7 +338,10 @@ def main():
         tempdiff_n_sigma=args.tempdiff_sigma,
         margin_black=args.margin_black,
         margin_white=args.margin_white,
+        use_mediapipe=args.mediapipe,
     )
+    if args.mediapipe:
+        print("MediaPipe hand mask ENABLED")
     det_state = detector.det_state
     n_keys = len(types)
 
@@ -505,6 +512,8 @@ def main():
         M = det_state["M"]
         W, H = det_state["W"], det_state["H"]
         warped = cv2.warpPerspective(bgr, M, (W, H))
+        # Pass the source frame for MediaPipe (no-op if --mediapipe off).
+        detector.set_source_frame(bgr)
         press_set, line_viz = detector.process(warped)
         if hand_gate is not None:
             candidate_set = hand_gate.candidate_keys(bgr)

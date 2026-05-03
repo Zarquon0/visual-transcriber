@@ -34,6 +34,8 @@ Workflow:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -46,15 +48,25 @@ from analyze import (
     skin_mask as ycrcb_skin_mask,
 )
 
+try:
+    import mediapipe as mp
+    from mediapipe.tasks.python import vision as mp_vision
+    from mediapipe.tasks.python import BaseOptions as _MPBaseOptions
+    _MP_AVAILABLE = True
+except ImportError:
+    _MP_AVAILABLE = False
 
-# Hand-mask tuning constants. Mask uses per-pixel **saturation increase**
-# vs the rest baseline (computed in HSV space) as the shadow-vs-hand
-# discriminator: a hand replaces a key pixel with skin, which has higher
-# saturation than the off-white/warm key. A shadow keeps the same key
-# pixel just darker — saturation stays similar. This cleanly separates
-# the two cases without needing color matching to a fixed skin range.
+_MP_MODEL_PATH = Path(__file__).parent / "hand_landmarker.task"
+
+
+# Hand-mask tuning. Per-pixel candidate test (sat_increase + V change)
+# captures hands, but ALSO press-edge sat-jumps (smaller blobs along
+# polygon boundaries). Filter happens at the BLOB level — small blobs
+# (press-edges) never enter persistence; only large hand-shaped blobs do.
 REST_V_DIFF_T = 20      # |V_curr - V_rest| > this counts as foreground
-SAT_INCREASE_T = 8      # S_curr - S_rest > this means "pixel got more saturated" (hand)
+SAT_INCREASE_T = 8      # S_curr - S_rest > this means "pixel got more saturated"
+HAND_BLOB_MIN_AREA = 300       # min pixels for a strong_fg blob to be "hand"
+HAND_BLOB_MIN_THICKNESS = 8    # min(w, h) of blob bbox — press-edges fail this
 PERSISTENCE_FRAMES = 12
 MIN_TIGHT_AREA = 100
 MIN_TIGHT_THICKNESS = 4
@@ -73,6 +85,7 @@ class Detector:
         tempdiff_n_sigma: float = 0.5,
         margin_black: float = 1.5,
         margin_white: float = 0.6,
+        use_mediapipe: bool = False,
     ):
         self.det_state = build_overlays(keys_dict)
         self.types = [k["type"] for k in keys_dict["keys"]]
@@ -119,6 +132,29 @@ class Detector:
         self._prev_gray = None
         self._lsd = cv2.createLineSegmentDetector()
 
+        # MediaPipe-based hand mask (color-independent, robust to skin
+        # tone, much cleaner than heuristics). Runs on the SOURCE frame
+        # (not warped), then projects hand-landmark convex hull into
+        # warped space using the calibration's perspective transform M.
+        self.use_mediapipe = (
+            use_mediapipe and _MP_AVAILABLE and _MP_MODEL_PATH.exists()
+        )
+        self._mp_landmarker = None
+        self._source_frame = None  # caller sets via set_source_frame() each frame
+        if self.use_mediapipe:
+            options = mp_vision.HandLandmarkerOptions(
+                base_options=_MPBaseOptions(model_asset_path=str(_MP_MODEL_PATH)),
+                num_hands=2,
+                min_hand_detection_confidence=0.2,   # was 0.5
+                min_hand_presence_confidence=0.2,
+                min_tracking_confidence=0.2,
+                running_mode=mp_vision.RunningMode.IMAGE,
+            )
+            self._mp_landmarker = mp_vision.HandLandmarker.create_from_options(options)
+        elif use_mediapipe:
+            print("[Detector] mediapipe requested but unavailable: "
+                  f"installed={_MP_AVAILABLE}  model_exists={_MP_MODEL_PATH.exists()}")
+
     # ── Setters / channel enablement ─────────────────────────────────────
 
     def set_line_thresholds(self, thresholds: np.ndarray):
@@ -157,6 +193,11 @@ class Detector:
     def set_margin_white(self, m: float):
         self.margin_white = m
 
+    def set_source_frame(self, source_bgr: np.ndarray):
+        """Cache the current source (pre-warp) frame for MediaPipe hand
+        detection. Caller passes this every frame BEFORE process()."""
+        self._source_frame = source_bgr
+
     def reset_smoothing(self):
         self._line_buf[:] = 0
         self._bright_buf[:] = np.nan
@@ -168,18 +209,130 @@ class Detector:
 
     # ── Hand mask ────────────────────────────────────────────────────────
 
-    def _compute_hand_mask(self, warped_bgr: np.ndarray, warped_gray: np.ndarray):
-        """HSV-saturation-increase hand mask.
+    # MediaPipe Hand Landmarker connection topology (21 landmarks per hand).
+    _MP_HAND_CONNECTIONS = (
+        (0, 1), (1, 2), (2, 3), (3, 4),         # thumb
+        (0, 5), (5, 6), (6, 7), (7, 8),         # index
+        (5, 9), (9, 10), (10, 11), (11, 12),    # middle
+        (9, 13), (13, 14), (14, 15), (15, 16),  # ring
+        (13, 17), (17, 18), (18, 19), (19, 20), # pinky
+        (0, 17),                                # palm wrist-pinky base
+    )
+    _MP_PALM_INDICES = (0, 1, 5, 9, 13, 17)
 
-        Per pixel:
-          hand = (V changed significantly) AND (S increased vs rest)
-        A hand replaces a key with skin → saturation jumps up. A shadow
-        keeps the same key, just darker → saturation barely changes. A
-        pressed key shifts intensity slightly with no real saturation
-        change. Only true hand pixels satisfy both conditions.
-        Plus: persistence (keeps held hands masked), connected-component
-        blob filter on tight pixels (kills scattered noise).
+    def _mediapipe_search_region(self, warped_shape):
+        """Returns a generous binary search region around hand bones in
+        warped space (skeleton + dilated). The actual hand mask is then
+        the subset of pixels INSIDE this region that pass per-pixel
+        rest-diff + saturation-increase tests — width comes from real
+        pixel data, not hardcoded bone-thickness."""
+        if (
+            self._mp_landmarker is None
+            or self._source_frame is None
+            or self._source_frame.size == 0
+        ):
+            return None
+        rgb = cv2.cvtColor(self._source_frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self._mp_landmarker.detect(mp_image)
+        if not result.hand_landmarks:
+            return None
+        H, W = warped_shape
+        h_src, w_src = self._source_frame.shape[:2]
+        M = self.det_state["M"]
+        skeleton = np.zeros((H, W), dtype=np.uint8)
+        for hand_landmarks in result.hand_landmarks:
+            pts_src = np.array(
+                [[lm.x * w_src, lm.y * h_src] for lm in hand_landmarks],
+                dtype=np.float32,
+            )
+            pts_warped = cv2.perspectiveTransform(
+                pts_src.reshape(-1, 1, 2), M
+            ).reshape(-1, 2).astype(np.int32)
+            # Thin skeleton (3 px); width comes from search-region dilate
+            # below + per-pixel test inside.
+            for a, b in self._MP_HAND_CONNECTIONS:
+                cv2.line(
+                    skeleton, tuple(pts_warped[a]), tuple(pts_warped[b]),
+                    255, thickness=3, lineType=cv2.LINE_AA,
+                )
+            palm_pts = pts_warped[list(self._MP_PALM_INDICES)]
+            cv2.fillPoly(skeleton, [palm_pts], 255)
+        # Dilate to a generous search region (covers any plausible finger
+        # / palm thickness for the camera angle without committing to a
+        # specific number).
+        return cv2.dilate(
+            skeleton, cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
+        )
+
+    def _compute_hand_mask(self, warped_bgr: np.ndarray, warped_gray: np.ndarray):
+        """Hand mask. When MediaPipe is enabled, trust it: if MP doesn't
+        detect hands this frame, NO mask is applied (which is correct —
+        no hands present, no need to mask anything). Brief persistence
+        (~5 frames) keeps the mask alive across single-frame MP misses
+        from low-confidence detection or occlusion.
+
+        When MediaPipe is disabled, falls back to the saturation-increase
+        heuristic (kept as a non-ML path; less reliable, color-dependent).
         """
+        # ── MediaPipe search-region + per-pixel test (data-driven width) ──
+        # MP skeleton provides LOCATION; per-pixel rest-diff + saturation-
+        # increase tests determine which pixels are actually hand. Width
+        # of the mask comes from real image data, not a hardcoded thickness.
+        # When MP misses (e.g., only a fingertip is visible), a fallback
+        # finds skin-like blobs of fingertip-plausible size.
+        if self.use_mediapipe:
+            if (
+                self._hand_persistence is None
+                or self._hand_persistence.shape != warped_gray.shape
+            ):
+                self._hand_persistence = np.zeros(warped_gray.shape, dtype=np.uint8)
+            self._hand_persistence[self._hand_persistence > 0] -= 1
+
+            # Compute per-pixel hand-evidence (works regardless of MP).
+            hand_evidence = None
+            if (
+                self._rest_mean_frame is not None
+                and self._rest_mean_bgr is not None
+            ):
+                rest_diff = cv2.absdiff(warped_gray, self._rest_mean_frame)
+                hsv_curr = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
+                hsv_rest = cv2.cvtColor(self._rest_mean_bgr, cv2.COLOR_BGR2HSV)
+                sat_inc = (
+                    hsv_curr[..., 1].astype(np.int16)
+                    - hsv_rest[..., 1].astype(np.int16)
+                )
+                # Hand evidence: pixel changed AND became more saturated.
+                hand_evidence = (rest_diff > 15) & (sat_inc > 5)
+
+            search = self._mediapipe_search_region(warped_gray.shape)
+            current = np.zeros(warped_gray.shape, dtype=bool)
+
+            if search is not None and np.any(search):
+                # MP detected: keep pixels in search region that pass evidence.
+                if hand_evidence is not None:
+                    current = (search > 0) & hand_evidence
+                else:
+                    current = (search > 0)
+            elif hand_evidence is not None:
+                # MP missed: fingertip-fallback. Find sat/rest-diff blobs
+                # of fingertip-plausible size (50-2000 px) anywhere.
+                ev_u8 = hand_evidence.astype(np.uint8) * 255
+                ev_dilated = cv2.dilate(
+                    ev_u8, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                )
+                n_lab, lbl, st, _ = cv2.connectedComponentsWithStats(
+                    ev_dilated, connectivity=8
+                )
+                for ci in range(1, n_lab):
+                    area = st[ci, cv2.CC_STAT_AREA]
+                    if 50 < area < 2000:
+                        current |= (lbl == ci) & hand_evidence
+            if np.any(current):
+                self._hand_persistence[current] = 1
+            return ((self._hand_persistence > 0).astype(np.uint8) * 255)
+
+        # ── Heuristic fallback path (no ML): saturation-increase ────
         if self._rest_mean_frame is None or self._rest_mean_bgr is None:
             return np.zeros(warped_gray.shape, dtype=np.uint8)
         hsv_curr = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
@@ -190,19 +343,42 @@ class Detector:
         sat_increase = (
             hsv_curr[..., 1].astype(np.int16) - hsv_rest[..., 1].astype(np.int16)
         )
-        # Strong hand candidate: significant V change AND saturation jumped up.
+        # Per-pixel candidate (catches hands AND press-edges).
         strong_fg = (v_diff > REST_V_DIFF_T) & (sat_increase > SAT_INCREASE_T)
-        # Weak: any V change at all (used during persistence decay).
         weak_fg = v_diff > REST_V_DIFF_T
+
+        # BLOB-LEVEL filter BEFORE persistence: classify each connected
+        # component as "hand" (large + chunky) or "press-edge" (small or
+        # thin). Press-edge blobs are dropped from strong_fg, so they
+        # never enter persistence and can't propagate forward as hand.
+        sf_u8 = strong_fg.astype(np.uint8) * 255
+        sf_dilated = cv2.dilate(
+            sf_u8, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        )
+        n_pre, lbl_pre, st_pre, _ = cv2.connectedComponentsWithStats(
+            sf_dilated, connectivity=8
+        )
+        hand_blob_mask = np.zeros(n_pre, dtype=bool)
+        for ci in range(1, n_pre):
+            x, y, w_, h_, area = st_pre[ci]
+            if area < HAND_BLOB_MIN_AREA:
+                continue
+            if min(int(w_), int(h_)) < HAND_BLOB_MIN_THICKNESS:
+                continue
+            hand_blob_mask[ci] = True
+        # Strong_fg, but only pixels that belong to a hand-classified blob.
+        strong_fg_filtered = strong_fg & hand_blob_mask[lbl_pre]
+
         if (self._hand_persistence is None
                 or self._hand_persistence.shape != warped_gray.shape):
             self._hand_persistence = np.zeros(warped_gray.shape, dtype=np.uint8)
-        self._hand_persistence[strong_fg] = PERSISTENCE_FRAMES
-        decay = (~strong_fg) & (self._hand_persistence > 0)
+        self._hand_persistence[strong_fg_filtered] = PERSISTENCE_FRAMES
+        decay = (~strong_fg_filtered) & (self._hand_persistence > 0)
         self._hand_persistence[decay] -= 1
         recent_hand = self._hand_persistence > 0
         mask_tight = (
-            (strong_fg | (recent_hand & weak_fg)).astype(np.uint8) * 255
+            (strong_fg_filtered | (recent_hand & weak_fg))
+            .astype(np.uint8) * 255
         )
         # Connected components on dilated mask, filter by tight-pixel shape.
         mask_grouped = cv2.dilate(
