@@ -1049,8 +1049,13 @@ class Detector:
         raw_act[top_band:, :] = 0
         self._last_diff_raw_mask = raw_act.copy()
         act_bool = raw_act > 0
-        if hand_mask is not None and hand_mask.size:
-            act_bool &= ~(hand_mask > 0)
+        # Hand mask AND_NOT is intentionally OMITTED here. MP's bulky
+        # mask (joint caps, wrist cap, 65×65 dilation) was eating real
+        # press signal. The MP viz still renders for diagnostic panels
+        # but doesn't gate detection — pure top-15% pixel-change +
+        # cam-side geometric assignment is the active pipeline.
+        # (Re-enable by AND_NOT'ing hand_mask if false-positives on
+        # hands ever become a real problem.)
 
         # Drop tiny stray components left after hand exclusion (single-
         # pixel speckle, edge slivers from imperfect masking).
