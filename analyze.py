@@ -56,11 +56,21 @@ def build_overlays(keys_dict: dict):
     key_id_map = np.full((H, W), -1, dtype=np.int32)
     for ki, poly in enumerate(polys):
         cv2.fillPoly(key_id_map, [poly], ki)
-    # per-key boolean mask + area
+    # per-key boolean mask + area. Erode each polygon by 2 px so the
+    # boundary band between adjacent keys doesn't count toward either
+    # key — fixes adjacent-key cross-fire (white press triggering
+    # neighbor black, etc.) and also kills thin edge-jitter slivers
+    # along polygon borders.
+    ERODE_KEY_PX = 2
+    erode_kernel = np.ones(
+        (ERODE_KEY_PX * 2 + 1, ERODE_KEY_PX * 2 + 1), dtype=np.uint8
+    )
     per_key_mask = [np.zeros((H, W), dtype=np.uint8) for _ in polys]
     per_key_area = np.zeros(len(polys), dtype=np.float32)
     for ki, poly in enumerate(polys):
         cv2.fillPoly(per_key_mask[ki], [poly], 1)
+        if ERODE_KEY_PX > 0:
+            per_key_mask[ki] = cv2.erode(per_key_mask[ki], erode_kernel)
         per_key_area[ki] = float(per_key_mask[ki].sum())
     # boundary band: dilated polygon edge for ALL polygons, used as the
     # "expected lines exist here" exclusion mask for C2.

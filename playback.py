@@ -33,6 +33,51 @@ from record import (
     draw_overlay_with_pressed,
     draw_warp_colored,
 )
+
+
+_NOTE_LABEL_TO_ENUM = None  # populated lazily so playback works without transcribe deps
+
+
+def _label_to_key(label):
+    """Parse 'C#3' → transcribe.Key(Note.CS, 3). None for '?' or malformed."""
+    global _NOTE_LABEL_TO_ENUM
+    if not label or label == "?":
+        return None
+    if _NOTE_LABEL_TO_ENUM is None:
+        from transcribe import Key, Note
+        _NOTE_LABEL_TO_ENUM = ({
+            "C": Note.C, "C#": Note.CS, "D": Note.D, "D#": Note.DS,
+            "E": Note.E, "F": Note.F, "F#": Note.FS, "G": Note.G,
+            "G#": Note.GS, "A": Note.A, "A#": Note.AS, "B": Note.B,
+        }, Key)
+    table, KeyCls = _NOTE_LABEL_TO_ENUM
+    # Find where the octave digits start (handles negative octaves too).
+    for i, ch in enumerate(label):
+        if ch.isdigit() or (ch == "-" and i < len(label) - 1):
+            try:
+                octave = int(label[i:])
+            except ValueError:
+                return None
+            note = table.get(label[:i])
+            return KeyCls(note, octave) if note is not None else None
+    return None
+
+
+def _label_panel(img, label, target_w=1200):
+    """Resize to common width and stamp a label in the top-left corner."""
+    if img is None:
+        return np.zeros((40, target_w, 3), dtype=np.uint8)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    h, w = img.shape[:2]
+    scale = target_w / max(1, w)
+    new_h = max(1, int(round(h * scale)))
+    out = cv2.resize(img, (target_w, new_h))
+    cv2.putText(out, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(out, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    return out
 from analyze import (
     skin_mask, channel_brightness, channel_slope, channel_temp_diff,
 )
@@ -262,7 +307,10 @@ def main():
     ap.add_argument("--margin", type=float, default=1.2,
                     help="multiplier on chaos_max when loading per-key thresholds")
     ap.add_argument("--debounce", type=int, default=2,
-                    help="frames a key must stay above threshold before flagging press")
+                    help="frames a key must stay above threshold before flagging "
+                         "press (default 2 — rejects 1-frame flashes; bump to 3+ "
+                         "if hand sweeps still cause false positives, or 1 for "
+                         "minimal latency at the cost of sweep rejection)")
     ap.add_argument("--rest-baseline", default=None,
                     help="rest folder; if given, replaces YCrCb skin mask with motion mask")
     ap.add_argument("--top-crop", type=int, default=0,
@@ -281,6 +329,33 @@ def main():
                     help="use MediaPipe Hands for the hand mask (color-independent, "
                          "robust to skin tone). Falls back to saturation-increase "
                          "heuristic if MediaPipe doesn't detect hands in a frame.")
+    ap.add_argument("--mog2", action="store_true",
+                    help="train BackgroundSubtractorMOG2 on rest+chaos clips so "
+                         "the multi-modal background includes hand-passing and "
+                         "shadow states. Press = pixel values never seen during "
+                         "training. Per-polygon foreground count becomes a "
+                         "press signal robust to shadow + hand variation.")
+    ap.add_argument("--diff", action="store_true",
+                    help="use press_diff approach as primary detection: "
+                         "absdiff-vs-rest baseline, threshold@75, top-frame blob "
+                         "filter, then per-key score = fraction of safe-mask "
+                         "covered by activation (after MP hand-mask exclusion).")
+    ap.add_argument("--diff-press-pixels", type=int, default=20,
+                    help="per-key activated-pixel count to fire a press in --diff mode")
+    ap.add_argument("--diff-min-blob-area", type=int, default=15,
+                    help="connected-component area floor on the post-hand "
+                         "activation mask (drops noise specks)")
+    ap.add_argument("--diff-boundary-margin", type=int, default=1,
+                    help="erode each key polygon by this many px when "
+                         "assigning activated pixels — a ribbon along every "
+                         "seam is ignored, so a press at a boundary doesn't "
+                         "trigger both neighbors (default 1 → 2-px gap "
+                         "between adjacent keys)")
+    ap.add_argument("--transcribe", action="store_true",
+                    help="instantiate a Transcriber that plays a soundfont "
+                         "synth on every detected press and writes a MIDI "
+                         "file on quit (requires fluidsynth + a .sf2 in "
+                         "sound_fonts/ — see config.yaml)")
     ap.add_argument("--tempdiff-sigma", type=float, default=4.0,
                     help="press = temp_diff > chaos_mean + N*chaos_std (default 4)")
     ap.add_argument("--smooth-window", type=int, default=5,
@@ -339,11 +414,35 @@ def main():
         margin_black=args.margin_black,
         margin_white=args.margin_white,
         use_mediapipe=args.mediapipe,
+        use_diff_only=args.diff,
     )
     if args.mediapipe:
         print("MediaPipe hand mask ENABLED")
+    if args.diff:
+        detector.set_diff_thresholds(
+            args.diff_press_pixels, args.diff_min_blob_area
+        )
+        detector.set_diff_boundary_margin(args.diff_boundary_margin)
+        print(
+            f"DIFF-ONLY mode: press_pixel_count={args.diff_press_pixels} "
+            f"min_blob_area={args.diff_min_blob_area} "
+            f"boundary_margin={args.diff_boundary_margin}"
+        )
     det_state = detector.det_state
     n_keys = len(types)
+
+    # Optional Transcriber: plays a soundfont synth on press events and
+    # accumulates a MIDI track. Built lazily so playback works without
+    # the transcribe deps installed.
+    transcriber = None
+    key_to_transcribe_key: list = [None] * n_keys
+    if args.transcribe:
+        from transcribe import Transcriber
+        transcriber = Transcriber(fps=30.0 / max(1, args.stride))
+        for ki, k in enumerate(keys_dict["keys"]):
+            key_to_transcribe_key[ki] = _label_to_key(k.get("note", ""))
+        labeled = sum(1 for k in key_to_transcribe_key if k is not None)
+        print(f"Transcriber ENABLED — {labeled}/{n_keys} keys have parsable note labels")
 
     hand_gate = None
     if args.hand_gate or args.finger_only:
@@ -474,6 +573,119 @@ def main():
         detector.set_brightness_thresholds(bright_thresholds)
     if slope_baseline_mean is not None and slope_baseline_std is not None:
         detector.set_slope_baseline(slope_baseline_mean, slope_baseline_std)
+    # Train MOG2 background subtractor on rest + chaos clips so all of
+    # rest-state, hand-passing, and shadows become known background.
+    # Subsequent presses fire as foreground (truly novel pixel values).
+    if args.mog2:
+        rest_folder = auto_find_rest_folder(folder)
+        chaos_folder = auto_find_chaos_folder(folder)
+        train_frames = []
+        for fld, label in [(rest_folder, "rest"), (chaos_folder, "chaos")]:
+            if fld is None:
+                continue
+            try:
+                fs = FrameSource(fld)
+            except SystemExit:
+                continue
+            print(f"loading {label} frames for MOG2 training ({len(fs)})...")
+            M_, W_, H_ = det_state["M"], det_state["W"], det_state["H"]
+            for i in range(len(fs)):
+                bgr = fs.read(i)
+                if bgr is None:
+                    continue
+                train_frames.append(cv2.warpPerspective(bgr, M_, (W_, H_)))
+        if train_frames:
+            print(f"training MOG2 on {len(train_frames)} frames...")
+            detector.train_mog2(train_frames)
+            print("  MOG2 trained — frozen for press detection")
+
+            # ── Per-key chaos baseline ──────────────────────────────
+            # Re-run trained MOG2 on chaos frames with learning OFF
+            # (same as inference) and record per-key foreground-area
+            # mean+std. Press threshold becomes baseline + N*std rather
+            # than a fixed magic number — persistent-flicker regions
+            # self-calibrate to a higher threshold.
+            chaos_folder = auto_find_chaos_folder(folder)
+            if chaos_folder is not None:
+                try:
+                    fs_chaos = FrameSource(chaos_folder)
+                    M_, W_, H_ = (
+                        det_state["M"], det_state["W"], det_state["H"]
+                    )
+                    print(
+                        f"computing per-key chaos baseline on "
+                        f"{len(fs_chaos)} chaos frames..."
+                    )
+                    score_rows = []
+                    pixel_fg_count = None
+                    n_chaos_used = 0
+                    for i in range(len(fs_chaos)):
+                        bgr_c = fs_chaos.read(i)
+                        if bgr_c is None:
+                            continue
+                        warped_c = cv2.warpPerspective(
+                            bgr_c, M_, (W_, H_)
+                        )
+                        mog_mask_c = detector.mog2_apply(warped_c)
+                        if mog_mask_c is None:
+                            continue
+                        # Apply hand mask EXACTLY as inference does — chaos
+                        # frames have hands moving over keys; without this,
+                        # baseline scores are inflated by hand pixels and
+                        # press thresholds blow up.
+                        detector.set_source_frame(bgr_c)
+                        gray_c = cv2.cvtColor(warped_c, cv2.COLOR_BGR2GRAY)
+                        detector._compute_hand_mask(warped_c, gray_c)
+                        hand_c = detector._hand_persistence
+                        sc, _ = detector.mog2_score_keys(
+                            mog_mask_c, hand_mask=hand_c
+                        )
+                        score_rows.append(sc)
+                        # Track per-pixel foreground frequency AFTER hand
+                        # masking — pixels still firing here are the
+                        # genuinely-noisy ones (persistent blob, etc).
+                        fg_post_hand = (mog_mask_c == 255).astype(np.uint8)
+                        if hand_c is not None and hand_c.shape == fg_post_hand.shape:
+                            fg_post_hand[hand_c > 0] = 0
+                        if pixel_fg_count is None:
+                            pixel_fg_count = fg_post_hand.astype(np.int32)
+                        else:
+                            pixel_fg_count += fg_post_hand
+                        n_chaos_used += 1
+                    if score_rows:
+                        arr = np.stack(score_rows, axis=0)
+                        detector.set_chaos_baseline_from_scores(arr)
+                        thr = detector._mog_per_key_threshold
+                        print(
+                            f"  per-key thr  "
+                            f"median={np.median(thr):.1f}  "
+                            f"min={thr.min():.1f}  max={thr.max():.1f}"
+                        )
+                    if pixel_fg_count is not None and n_chaos_used > 0:
+                        flicker_frac = (
+                            pixel_fg_count.astype(np.float32) / float(n_chaos_used)
+                        )
+                        flicker_thr = detector.MOG_PIXEL_FLICKER_THRESHOLD
+                        flicker_mask = (
+                            flicker_frac > flicker_thr
+                        ).astype(np.uint8) * 255
+                        detector.set_persistent_flicker_mask(flicker_mask)
+                        n_flicker = int((flicker_mask > 0).sum())
+                        print(
+                            f"  persistent-flicker pixels: {n_flicker} "
+                            f"(>{flicker_thr*100:.0f}% of {n_chaos_used} chaos frames)"
+                        )
+                    # Clear hand-mask persistence + runtime flicker EMA so
+                    # chaos state doesn't bleed into press-clip inference.
+                    detector._hand_persistence = None
+                    detector._prev_gray = None
+                    detector._mog_runtime_flicker_ema = None
+                    detector._mog_score_history = None
+                    detector._mog_score_history_idx = 0
+                    detector._mog_score_history_filled = 0
+                except SystemExit:
+                    pass
+
     if tempdiff_chaos_mean is not None and tempdiff_chaos_std is not None:
         detector.set_tempdiff_chaos_stats(tempdiff_chaos_mean, tempdiff_chaos_std)
 
@@ -522,12 +734,201 @@ def main():
             else:
                 press_set = press_set & candidate_set
         last_press_set = press_set
-        # Three-panel warp_lines view:
-        #   1) raw warp (top)
-        #   2) filled-color segmentation (middle) — same as record.py warp_cam0
-        #   3) line classification + skin overlay (bottom)
+        # Feed pressed keys to the Transcriber (plays sound + records MIDI).
+        if transcriber is not None:
+            keys_now = [
+                key_to_transcribe_key[ki] for ki in press_set
+                if key_to_transcribe_key[ki] is not None
+            ]
+            transcriber.update(keys_now)
+        # Pipeline-order panels for warp_lines.
         segmented_warp = draw_warp_colored(warped, keys_dict)
-        cv2.imshow("warp_lines", np.vstack([warped, segmented_warp, line_viz]))
+
+        if args.diff:
+            # 1) raw warp + press overlay  →  2) segmentation  →
+            # 3) MP hand mask viz  →  4) MP extended warp  →
+            # 5) press-diff raw mask  →  6) per-key activation overlay
+            warp_with_press = warped.copy()
+            for pk in press_set:
+                try:
+                    poly = np.array(
+                        keys_dict["keys"][pk]["polygon"], dtype=np.int32
+                    ).reshape(-1, 1, 2)
+                    cv2.drawContours(
+                        warp_with_press, [poly], -1, (0, 0, 255), 3, cv2.LINE_AA
+                    )
+                except Exception:
+                    pass
+            panels = [
+                _label_panel(warp_with_press, "1. RAW WARP + PRESSES"),
+                _label_panel(segmented_warp, "2. SEGMENTATION"),
+                _label_panel(detector._last_hand_viz, "3. HAND MASK (MP)"),
+            ]
+            if args.mediapipe and detector._last_mp_ext_viz is not None:
+                panels.append(_label_panel(
+                    detector._last_mp_ext_viz, "4. MP EXTENDED WARP"
+                ))
+            panels.append(_label_panel(
+                detector._last_diff_raw_mask, "5. PRESS DIFF (raw mask)"
+            ))
+            panels.append(_label_panel(
+                detector._last_diff_counted_mask,
+                "6. COUNTED (-hand -boundary) <- actual press signal",
+            ))
+            panels.append(_label_panel(
+                detector._last_diff_overlay, "7. PER-KEY ACTIVATION + SCORES"
+            ))
+            cv2.imshow("warp_lines", np.vstack(panels))
+            # Source-frame overlay still happens below.
+            disp = draw_overlay_with_pressed(
+                bgr, polys_src, sbb_src, types, press_set
+            )
+            if args.hands_debug and hand_gate is not None:
+                disp = hand_gate.draw(disp, hand_gate._last_raw_tips)
+            ph = 540
+            pw = max(1, int(disp.shape[1] * (ph / disp.shape[0])))
+            disp = cv2.resize(disp, (pw, ph))
+            thr_label = (
+                f"diff: press_pix={detector._diff_press_pixel_count} "
+                f"min_blob={detector._diff_min_blob_area} "
+                f"bnd={detector._diff_boundary_margin}"
+            )
+            hud = [
+                f"frame {idx}/{len(frames)-1}  {thr_label}",
+                f"pressed: {sorted(press_set) if press_set else 'none'}",
+                ("PAUSED" if paused else f"play {args.speed:.1f}x"),
+                "SPACE=pause  1/2=press_pix  3/4=min_blob  5/6=bnd  m=motion_supp  ,/.=±30f  s=snap  ESC=quit",
+            ]
+            for i, t in enumerate(hud):
+                y = 24 + i * 22
+                cv2.putText(disp, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 0, 0), 4, cv2.LINE_AA)
+                color = (0, 0, 255) if t == "PAUSED" or "pressed" in t and press_set else (255, 255, 255)
+                cv2.putText(disp, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, color, 1, cv2.LINE_AA)
+            cv2.imshow("playback", disp)
+
+            elapsed = time.perf_counter() - t0
+            wait_ms = max(1, int((target_dt - elapsed) * 1000))
+            k = cv2.waitKey(wait_ms) & 0xFF
+            if k in (27, ord("q")):
+                break
+            elif k == ord(" "):
+                paused = not paused
+            elif k == ord("1"):
+                detector._diff_press_pixel_count = max(
+                    1, detector._diff_press_pixel_count - 5
+                )
+                print(f"diff press_pix: {detector._diff_press_pixel_count}")
+            elif k == ord("2"):
+                detector._diff_press_pixel_count += 5
+                print(f"diff press_pix: {detector._diff_press_pixel_count}")
+            elif k == ord("3"):
+                detector._diff_min_blob_area = max(
+                    1, detector._diff_min_blob_area - 5
+                )
+                print(f"diff min_blob: {detector._diff_min_blob_area}")
+            elif k == ord("4"):
+                detector._diff_min_blob_area += 5
+                print(f"diff min_blob: {detector._diff_min_blob_area}")
+            elif k == ord("5"):
+                detector.set_diff_boundary_margin(
+                    max(0, detector._diff_boundary_margin - 1)
+                )
+                print(f"diff boundary_margin: {detector._diff_boundary_margin}")
+            elif k == ord("6"):
+                detector.set_diff_boundary_margin(
+                    detector._diff_boundary_margin + 1
+                )
+                print(f"diff boundary_margin: {detector._diff_boundary_margin}")
+            elif k == ord("m"):
+                detector._motion_supp_enabled = not detector._motion_supp_enabled
+                print(f"motion supplement: "
+                      f"{'ON' if detector._motion_supp_enabled else 'OFF'} "
+                      f"(thr={detector._motion_supp_threshold})")
+            elif k == ord("["):
+                idx = max(0, idx - 2)
+                paused = True
+            elif k == ord("]"):
+                idx = min(len(frames) - 1, idx + 1)
+                paused = True
+            elif k == ord(","):
+                idx = max(0, idx - 31)
+                paused = True
+            elif k == ord("."):
+                idx = min(len(frames) - 1, idx + 29)
+                paused = True
+            elif k == ord("<"):
+                idx = max(0, idx - 151)
+                paused = True
+            elif k == ord(">"):
+                idx = min(len(frames) - 1, idx + 149)
+                paused = True
+            elif k == ord("0"):
+                idx = 0
+                paused = True
+            elif k == ord("9"):
+                idx = len(frames) - 1
+                paused = True
+            elif k == ord("s"):
+                ts = int(time.time())
+                sp = snap_dir / f"playback_{ts}_f{idx:06d}.png"
+                cv2.imwrite(str(sp), disp)
+                print(f"saved {sp}")
+            if not paused and idx >= len(frames) - 1:
+                print(f"end. last_press_set={sorted(last_press_set)}")
+                paused = True
+            continue
+
+        # Non-diff: original 4-channel pipeline view.
+        # 1) raw warp (top)
+        # 2) filled-color segmentation (middle) — same as record.py warp_cam0
+        # 3) line classification + skin overlay (bottom)
+        # +4th MP extended-warp viz when --mediapipe enabled.
+        # +5th MOG2 foreground viz when --mog2 enabled.
+        panels = [warped, segmented_warp, line_viz]
+        if args.mediapipe and detector._last_mp_ext_viz is not None:
+            panels.append(detector._last_mp_ext_viz)
+        if args.mog2:
+            mog_mask = detector.mog2_apply(warped)
+            if mog_mask is not None:
+                hand_mask_now = detector._hand_persistence
+                # Shape-filtered per-key score + cleaned mask for viz.
+                mog_press_scores, mog_mask_clean = detector.mog2_score_keys(
+                    mog_mask, hand_mask=hand_mask_now
+                )
+                # Apply chaos-baseline + temporal-derivative gate.
+                press_set = detector.mog2_press_set(mog_press_scores)
+                last_press_set = press_set
+                # Visualization: cleaned foreground in red, shadow class
+                # (MOG2 detectShadows=True marks them as 127) in cyan.
+                mog_viz = warped.copy()
+                mog_viz[mog_mask_clean == 255] = (0, 0, 255)
+                mog_viz[mog_mask_clean == 127] = (200, 200, 0)
+                # Annotate top-3 keys by score with score / per-key threshold
+                top3 = np.argsort(-mog_press_scores)[:3]
+                for ki in top3:
+                    if mog_press_scores[ki] < 5:
+                        continue
+                    ys, xs = detector.det_state["per_key_mask"][ki].nonzero()
+                    if xs.size == 0:
+                        continue
+                    x = int(xs.min())
+                    y = int(ys.min())
+                    thr_k = detector.mog2_threshold_for(ki)
+                    txt = f"k{ki}:{int(mog_press_scores[ki])}/{int(thr_k)}"
+                    cv2.putText(
+                        mog_viz, txt, (x, y + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4, (0, 0, 0), 3, cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        mog_viz, txt, (x, y + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4, (255, 255, 0), 1, cv2.LINE_AA,
+                    )
+                panels.append(mog_viz)
+        cv2.imshow("warp_lines", np.vstack(panels))
         if args.hands_debug and hand_gate is not None:
             cv2.imshow("hand_warped_debug", hand_gate.draw_warped_debug(warped))
 
@@ -626,6 +1027,15 @@ def main():
 
     if hand_gate is not None:
         hand_gate.close()
+    if transcriber is not None:
+        midi_dir = Path("midi_outs")
+        midi_dir.mkdir(exist_ok=True)
+        midi_path = midi_dir / time.strftime("%Y%m%d_%H%M%S.mid")
+        try:
+            transcriber.save_midi(str(midi_path))
+            print(f"saved MIDI to {midi_path}")
+        except Exception as e:
+            print(f"transcriber save_midi failed: {e}")
     cv2.destroyAllWindows()
 
 

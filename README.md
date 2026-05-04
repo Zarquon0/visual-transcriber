@@ -8,12 +8,19 @@ To run scripts:
 uv run python <script>
 ```
 ### Additional Setup for Transcriber Usage
-The `Transcriber` object in `transcriber.py` enables live playing through an external synthesizer. To get live playing to work:
+The `Transcriber` object in `transcribe.py` enables live playing through an external synthesizer. To get live playing to work:
 ```zsh
 # On Mac
 brew install fluidsynth
 ```
 Additionally, you'll need at least one sound font file in `sound_fonts/`. One good option is [here](https://musical-artifacts.com/artifacts/1229/FluidR3_GM_GS.sf2). Feel free to add multiple sound fonts to this folder, you may optionally specify which one to use in `config.yaml`.
+
+### Additional Setup for MediaPipe Hand Mask
+`detection.py`'s `--mediapipe` path needs the MediaPipe Hand Landmarker model dropped at the repo root. It's gitignored (7.5 MB binary). Download once:
+```bash
+curl -L -o hand_landmarker.task \
+    https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+```
 
 ## Webcam Streaming
 `stream_webcams.py` creates cv2 connections to attached Canon R50 cameras. To properly connect cameras:
@@ -155,31 +162,79 @@ A live recording + offline playback workflow on top of the existing calibration 
 
 ### Quick start — copy-paste commands
 
-**Offline replay of a recorded clip (works on a fresh clone, MP4 fallback):**
+The current primary detection path is **`--diff`** (William's `press_diff.detect_press_regions` for the activation mask, MediaPipe for the hand mask, per-key absolute pixel-count scoring with boundary erosion). Use `--mediapipe` alongside `--diff` so hands are excluded properly. `--transcribe` plugs the press events into a soundfont synth + MIDI recorder.
+
+**Live capture + detection + audio from a Canon camera (the actual flow we use):**
 
 ```bash
-uv sync
+uv run python record.py --no-iphone --cam-index 0 \
+    --keys recordings/_snapshots/calib_<timestamp>_cam0_keys.json \
+    --mediapipe --diff \
+    --diff-press-pixels 5 --diff-min-blob-area 1 --diff-boundary-margin 1 \
+    --smooth-window 1 --transcribe
+```
+
+> **Pre-flight:** `brew install fluidsynth` (one-time), `uv sync`, drop a `.sf2` in `sound_fonts/` (we use `FluidR3_GM_GS.sf2`), set the macOS audio output device (System Settings → Sound or menu-bar volume icon) **before** launching — fluidsynth captures whichever device is default at startup and won't reroute mid-session.
+
+Then in the recorder window:
+1. Press **`c`** — auto-calibrate to current camera position. HUD shows `61 keys (b:25 w:36, labeled:61)` on success. The transcribe note-LUT is rebuilt from the calibration's note labels.
+2. Press **`d`** — enable detection.
+3. **Hands away from keyboard**, press **`b`** — captures REST baseline (60 frames ≈ 2 s in `--diff` mode; CHAOS phase is auto-skipped). HUD shows `REST CAPTURE — keep hands away (60 left)`. After it completes you'll see `DETECTING — pressed: …` on panel 1.
+4. Play. Pressed keys flash red on the source view + per-polygon overlay; fluidsynth plays each note via the loaded soundfont.
+5. **`ESC`** / **`q`** to quit. MIDI dumped to `midi_outs/YYYYMMDD_HHMMSS.mid`.
+
+**Offline replay of a recorded clip — same pipeline against bundled frames:**
+
+```bash
+uv run python playback.py recordings/1777663914_press \
+    --mediapipe --diff \
+    --diff-press-pixels 5 --diff-min-blob-area 1 --diff-boundary-margin 1 \
+    --smooth-window 3 --debounce 1 \
+    --transcribe
+```
+
+**The seven `warp_lines` panels** (top → bottom, both record.py `d` mode and playback.py):
+
+1. **RAW WARP + PRESSES** — pressed keys outlined red on the warped strip.
+2. **SEGMENTATION** — colored key polygons over the warp (calibration sanity check).
+3. **HAND MASK (MP)** — orange skin fill + magenta contour over warp (what MP + persistence excluded).
+4. **MP EXTENDED WARP** — broader rectified view MP runs on, with the keyboard region in red and the 21-landmark hand skeleton overlaid. Confirms that MediaPipe is actually detecting hands.
+5. **PRESS DIFF (raw mask)** — `detect_press_regions` output **before** hand exclusion. Should light up white wherever the live frame differs by ≥75 from the REST baseline.
+6. **COUNTED (-hand -boundary)** — panel 5 minus the hand mask AND minus the polygon-boundary ribbon. **This is the exact pixel signal that gets `bincount`-summed into per-key totals.** If a press shows up here, it counts.
+7. **PER-KEY ACTIVATION + SCORES** — per-polygon overlay with red activation fill + top-3 `kN: count/threshold` annotations on the most-active keys.
+
+**Live hotkeys** (focus warp_lines or playback window):
+- `SPACE` pause/resume (playback only) · `[`/`]` ±1 frame · `,`/`.` ±30 frames · `<`/`>` ±150 frames · `0`/`9` jump start/end (playback only)
+- `c` recalibrate / `d` toggle detect / `b` capture baseline (record.py only)
+- `1` / `2` press-pixel threshold − / + 5 (lower = more sensitive). Default 20; we run 5.
+- `3` / `4` min-blob area − / + 5 (CC area floor on post-hand mask). Default 15; we run 1 (= disabled).
+- `5` / `6` boundary margin − / + 1 px (ribbon ignored at every seam). Default 1; we run 1.
+- `m` toggle motion-supplement hand mask. Default OFF — turning it on adds frame-to-frame Δgray>80 pixels to the persistence map; useful against fast sweeps but can mask press signal.
+- `s` save current frame · `q` / `ESC` quit (saves MIDI if `--transcribe`).
+
+**What each diff knob does:**
+| Flag | Default in code | What we run | Effect |
+|---|---|---|---|
+| `--diff-press-pixels` | 20 | **5** | Per-key activated-pixel count needed to fire. Lower = more sensitive. |
+| `--diff-min-blob-area` | 15 (5 in our run) | **1** | CC area floor on post-hand activation mask. 1 = no filter. Higher rejects small specks. |
+| `--diff-boundary-margin` | 1 | **1** | Pixels of erosion per polygon → 2× px gap between adjacent keys. Stops boundary blobs cross-firing. 0 = no gap. |
+| `--smooth-window` | 5 (rec) / 5 (pb) | **1** (rec) / **3** (pb) | Rolling-mean window over per-key counts. Lower = snappier onset. |
+| `--debounce` | 1 (rec) / 3 (pb) | **1** (rec) / **1** (pb) | Frames a key must stay above threshold. 1 = instant. |
+
+These are all intentionally aggressive; press_diff's strict threshold-75 + top-frame blob filter means surviving activation is rarely noise.
+
+**Why ``--mediapipe``:** the hand mask. With it on, MP runs on every frame's extended warp, finds 21-landmark hand skeletons + convex hull, projects them into warped coords, and AND-NOT's them out of the activation mask before per-key counting.
+
+**Why ``--transcribe``:** wires `press_set` → `Key(note, octave)` → `Transcriber.update()` → fluidsynth note-on/off + MIDI accumulation. Soundfont is loaded from `sound_fonts/<config.yaml soundfont>`; if that field is empty the first `.sf2` in the folder is used.
+
+**Legacy 4-channel mode** (line / brightness / slope / tempdiff fusion, kept for comparison) — drop `--diff` and use the older flags:
+```bash
 uv run python playback.py recordings/1777663914_press \
     --thresholds recordings/_analysis/1777665677/summary.csv \
     --margin 1.0 --margin-black 1.5 --margin-white 0.6 \
     --bright-margin 1.5 --tempdiff-sigma 0.5 \
-    --smooth-window 3 --debounce 1
+    --smooth-window 3 --debounce 1 --mediapipe
 ```
-
-Two windows open: source view with red press flashes + `warp_lines` showing LSD segments and the orange/magenta hand-mask overlay. SPACE pause, `,/.` ±1 sec scrub, `1/2/3/4` per-type margin tuning.
-
-**Live capture + detection from a Canon camera:**
-
-```bash
-uv run python record.py --no-iphone --cam-index 0 \
-    --keys recordings/_snapshots/calib_1777663815_cam0_keys.json
-```
-
-Then in the recorder window:
-1. Press `c` to recalibrate to current camera position. Verify `61 keys (b:25 w:36, labeled:61)` in HUD.
-2. Press `d` to enable detection.
-3. **Hands away from keyboard**, press `b` to start two-phase baseline capture. HUD will say `REST CAPTURE — keep hands away (30 left)`. Wait until it switches to `CHAOS CAPTURE — hover, NO presses (60 left)`. Hover hands over keys without pressing for those frames.
-4. Once HUD says `DETECTING`, the detector is fully populated. Press keys; pressed keys flash red.
 
 ### `detection.py` — unified per-frame `Detector` class
 

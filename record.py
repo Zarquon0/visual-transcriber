@@ -40,6 +40,37 @@ from stream_webcams import open_canon_streams, CanonStream, _load_config
 from live_test import _find_specific_camera_index
 
 
+_NOTE_LABEL_TO_ENUM = None
+
+
+def _label_to_key(label: str):
+    """Parse 'C#3' → transcribe.Key(Note.CS, 3). None for '?' or malformed."""
+    global _NOTE_LABEL_TO_ENUM
+    if not label or label == "?":
+        return None
+    if _NOTE_LABEL_TO_ENUM is None:
+        from transcribe import Key, Note
+        _NOTE_LABEL_TO_ENUM = ({
+            "C": Note.C, "C#": Note.CS, "D": Note.D, "D#": Note.DS,
+            "E": Note.E, "F": Note.F, "F#": Note.FS, "G": Note.G,
+            "G#": Note.GS, "A": Note.A, "A#": Note.AS, "B": Note.B,
+        }, Key)
+    table, KeyCls = _NOTE_LABEL_TO_ENUM
+    for i, ch in enumerate(label):
+        if ch.isdigit() or (ch == "-" and i < len(label) - 1):
+            try:
+                octave = int(label[i:])
+            except ValueError:
+                return None
+            note = table.get(label[:i])
+            return KeyCls(note, octave) if note is not None else None
+    return None
+
+
+def _build_transcribe_lut(keys_dict):
+    return [_label_to_key(k.get("note", "")) for k in keys_dict["keys"]]
+
+
 def parse_keys_args(items: list[str]) -> dict[int, Path]:
     """Each --keys arg is 'path' (assigned to next free cam index) or 'path:idx'."""
     result: dict[int, Path] = {}
@@ -209,6 +240,31 @@ def main():
                     help="frames a candidate key stays live after fingertip leaves (default 5)")
     ap.add_argument("--hands-debug", action="store_true",
                     help="overlay raw fingertip landmarks and candidate key outlines")
+    ap.add_argument("--mediapipe", action="store_true",
+                    help="use MediaPipe Hands for the hand mask in live press detection")
+    ap.add_argument("--diff", action="store_true",
+                    help="use press_diff approach as primary live "
+                         "press detection (absdiff vs rest baseline + threshold + "
+                         "top-frame blob filter, scored per key polygon).")
+    ap.add_argument("--diff-press-pixels", type=int, default=20,
+                    help="per-key activated-pixel count to fire a press in --diff mode")
+    ap.add_argument("--diff-min-blob-area", type=int, default=15,
+                    help="connected-component area floor on the post-hand "
+                         "activation mask (drops noise specks)")
+    ap.add_argument("--diff-boundary-margin", type=int, default=1,
+                    help="px to erode each key polygon when assigning activated "
+                         "pixels (default 1 → 2-px gap between adjacent keys; "
+                         "0 = no gap, fastest signal recovery but adjacent keys "
+                         "may cross-fire on boundary blobs)")
+    ap.add_argument("--smooth-window", type=int, default=2,
+                    help="rolling-mean window over per-key counts before "
+                         "threshold check (default 2 — lower = snappier; was "
+                         "previously 5 and felt laggy at press onset)")
+    ap.add_argument("--transcribe", action="store_true",
+                    help="instantiate a Transcriber driven by cam0 presses: "
+                         "plays a soundfont synth on every detected press and "
+                         "writes a MIDI file on quit (requires fluidsynth + a "
+                         ".sf2 in sound_fonts/)")
     args = ap.parse_args()
 
     if args.cam_index is not None:
@@ -258,21 +314,40 @@ def main():
     from detection import Detector
     detectors: dict[int, Detector] = {}
     hand_gates: dict[int, object] = {}
+    # Transcriber driven by cam0 only (a single sound output per session).
+    # Built lazily once the first cam0 keys_dict is available, then per-frame
+    # `transcriber.update([Key, ...])` is called with cam0's pressed set.
+    transcriber = None
+    transcribe_luts: dict[int, list] = {}
     # Combined rest+chaos baseline capture state.
-    REST_FRAMES = 30
-    CHAOS_FRAMES = 60
+    # In --diff mode, REST is the only baseline that matters (CHAOS is
+    # unused). Use a longer REST capture (~2 s) to let auto-exposure /
+    # auto-white-balance settle, and skip CHAOS entirely.
+    REST_FRAMES = 60 if args.diff else 30
+    CHAOS_FRAMES = 0 if args.diff else 60
     bl_phase: dict[int, str] = {}   # cam_idx → "rest" | "chaos" | None
     bl_remaining: dict[int, int] = {}
     bl_rest_buf: dict[int, list] = {}
     bl_chaos_buf: dict[int, list] = {}
     bl_rest_gray_accum: dict[int, np.ndarray] = {}
+    bl_rest_bgr_accum: dict[int, np.ndarray] = {}
     bl_rest_n: dict[int, int] = {}
 
     # Pre-build detection state + Detector for any --keys files supplied
     # at launch, so 'd' works without needing 'c' first.
     for ci, p in keys_map.items():
         if ci < len(streams) and p.exists():
-            detectors[ci] = Detector(json.loads(p.read_text()))
+            kd_pre = json.loads(p.read_text())
+            detectors[ci] = Detector(
+                kd_pre,
+                use_mediapipe=args.mediapipe,
+                use_diff_only=args.diff,
+            )
+            if args.diff:
+                detectors[ci].set_diff_thresholds(args.diff_press_pixels, args.diff_min_blob_area)
+                detectors[ci].set_diff_boundary_margin(args.diff_boundary_margin)
+            if args.transcribe:
+                transcribe_luts[ci] = _build_transcribe_lut(kd_pre)
             if args.hand_gate:
                 from calibration import Calibration
                 from hand_gate import HandGate
@@ -281,6 +356,11 @@ def main():
                     candidate_ttl_frames=args.hand_ttl,
                     include_neighbors=args.hand_neighbors,
                 )
+
+    if args.transcribe:
+        from transcribe import Transcriber
+        transcriber = Transcriber(fps=30.0)
+        print("Transcriber ENABLED — driven by cam0 presses")
 
     print("controls: r/SPACE=record  s=snap  o=overlay  c=calibrate  "
           "/=crop+5  ,=crop-5  0=crop reset  k=save  d=detect  "
@@ -328,13 +408,18 @@ def main():
                     # Baseline capture in progress?
                     phase = bl_phase.get(ci)
                     if phase == "rest":
-                        # Accumulate per-pixel mean of warped gray.
+                        # Accumulate per-pixel mean of warped gray + BGR
+                        # (BGR needed for press_diff baseline).
                         if ci not in bl_rest_gray_accum:
                             bl_rest_gray_accum[ci] = np.zeros(
                                 warped_gray.shape, dtype=np.float64
                             )
+                            bl_rest_bgr_accum[ci] = np.zeros(
+                                warped.shape, dtype=np.float64
+                            )
                             bl_rest_n[ci] = 0
                         bl_rest_gray_accum[ci] += warped_gray.astype(np.float64)
+                        bl_rest_bgr_accum[ci] += warped.astype(np.float64)
                         bl_rest_n[ci] += 1
                         # Also collect raw line scores for slope baseline (no skin mask yet).
                         sk_empty = np.zeros(warped.shape[:2], dtype=np.uint8)
@@ -348,7 +433,12 @@ def main():
                             rest_mean_gray = (
                                 bl_rest_gray_accum[ci] / max(1, bl_rest_n[ci])
                             ).astype(np.uint8)
-                            detectors[ci].set_rest_mean_frame(rest_mean_gray)
+                            rest_mean_bgr = (
+                                bl_rest_bgr_accum[ci] / max(1, bl_rest_n[ci])
+                            ).astype(np.uint8)
+                            detectors[ci].set_rest_mean_frame(
+                                rest_mean_gray, rest_mean_bgr
+                            )
                             bb = np.array([d["bright"] for d in bl_rest_buf[ci]])
                             ss = np.array([d["slope"] for d in bl_rest_buf[ci]])
                             with np.errstate(invalid="ignore"):
@@ -358,14 +448,22 @@ def main():
                                 slope_mean = np.nanmean(ss, axis=0)
                                 slope_std = np.maximum(np.nanstd(ss, axis=0), 1.0)
                             detectors[ci].set_slope_baseline(slope_mean, slope_std)
-                            print(
-                                f"cam{ci} REST captured ({bl_rest_n[ci]} frames). "
-                                f"Now CHAOS phase: hover hands without pressing for "
-                                f"{CHAOS_FRAMES} frames."
-                            )
-                            bl_phase[ci] = "chaos"
-                            bl_remaining[ci] = CHAOS_FRAMES
-                            bl_chaos_buf[ci] = []
+                            if CHAOS_FRAMES <= 0:
+                                # --diff mode: no chaos needed.
+                                print(
+                                    f"cam{ci} REST captured ({bl_rest_n[ci]} frames). "
+                                    f"Detector ready (diff mode)."
+                                )
+                                bl_phase[ci] = None
+                            else:
+                                print(
+                                    f"cam{ci} REST captured ({bl_rest_n[ci]} frames). "
+                                    f"Now CHAOS phase: hover hands without pressing for "
+                                    f"{CHAOS_FRAMES} frames."
+                                )
+                                bl_phase[ci] = "chaos"
+                                bl_remaining[ci] = CHAOS_FRAMES
+                                bl_chaos_buf[ci] = []
                     elif phase == "chaos":
                         rest_gray = (
                             bl_rest_gray_accum[ci] / max(1, bl_rest_n[ci])
@@ -398,6 +496,9 @@ def main():
                             )
                             bl_phase[ci] = None
 
+                    # Pass source frame so MediaPipe (running on extended warp)
+                    # has the original-camera frame to project from.
+                    detectors[ci].set_source_frame(f)
                     # Run detection (will be partial until both baselines captured).
                     pressed, line_viz = detectors[ci].process(warped)
                     if args.hand_gate and ci in hand_gates:
@@ -405,6 +506,18 @@ def main():
                         det_press_set[ci] = pressed & candidate_set
                     else:
                         det_press_set[ci] = pressed
+                    # Drive the Transcriber from cam0's pressed set.
+                    if (
+                        transcriber is not None
+                        and ci == 0
+                        and ci in transcribe_luts
+                    ):
+                        lut = transcribe_luts[ci]
+                        keys_now = [
+                            lut[ki] for ki in det_press_set[ci]
+                            if ki < len(lut) and lut[ki] is not None
+                        ]
+                        transcriber.update(keys_now)
                     # HUD on viz: capture status or live detection state.
                     if phase == "rest":
                         msg = f"REST CAPTURE — keep hands away ({bl_remaining[ci]} left)"
@@ -413,10 +526,13 @@ def main():
                         msg = f"CHAOS CAPTURE — hover, NO presses ({bl_remaining[ci]} left)"
                         col = (0, 165, 255)
                     else:
-                        ready = (
-                            detectors[ci]._line_thresholds is not None
-                            and detectors[ci]._rest_mean_frame is not None
-                        )
+                        if args.diff:
+                            ready = detectors[ci]._rest_mean_bgr is not None
+                        else:
+                            ready = (
+                                detectors[ci]._line_thresholds is not None
+                                and detectors[ci]._rest_mean_frame is not None
+                            )
                         msg = (
                             f"DETECTING — pressed: {sorted(pressed) if pressed else 'none'}"
                             if ready
@@ -427,7 +543,59 @@ def main():
                                 0.6, (0, 0, 0), 4, cv2.LINE_AA)
                     cv2.putText(line_viz, msg, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, col, 1, cv2.LINE_AA)
-                    cv2.imshow(f"warp_lines_cam{ci}", np.vstack([warped, line_viz]))
+                    if args.diff:
+                        from playback import _label_panel
+                        warp_with_press = warped.copy()
+                        for pk in pressed:
+                            try:
+                                kdict_keys = detectors[ci].det_state
+                                # Recover polygon from per_key_mask via contour
+                                m = kdict_keys["per_key_mask"][pk]
+                                cnts_pk, _ = cv2.findContours(
+                                    m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                                )
+                                cv2.drawContours(
+                                    warp_with_press, cnts_pk, -1,
+                                    (0, 0, 255), 3, cv2.LINE_AA,
+                                )
+                            except Exception:
+                                pass
+                        # Live segmentation panel uses the inspector's colored draw.
+                        try:
+                            seg = draw_warp_colored(warped, pending_keys.get(ci))
+                        except Exception:
+                            seg = warped.copy()
+                        det = detectors[ci]
+                        panels = [
+                            _label_panel(warp_with_press, "1. RAW WARP + PRESSES"),
+                            _label_panel(seg, "2. SEGMENTATION"),
+                            _label_panel(det._last_hand_viz, "3. HAND MASK (MP)"),
+                        ]
+                        if args.mediapipe and det._last_mp_ext_viz is not None:
+                            panels.append(_label_panel(
+                                det._last_mp_ext_viz, "4. MP EXTENDED WARP"
+                            ))
+                        panels.append(_label_panel(
+                            det._last_diff_raw_mask, "5. PRESS DIFF (raw mask)"
+                        ))
+                        panels.append(_label_panel(
+                            det._last_diff_counted_mask,
+                            "6. COUNTED (-hand -boundary) <- press signal",
+                        ))
+                        panels.append(_label_panel(
+                            det._last_diff_overlay,
+                            "7. PER-KEY ACTIVATION + SCORES",
+                        ))
+                        # Stamp the HUD msg on the top panel.
+                        cv2.putText(panels[0], msg, (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    (0, 0, 0), 4, cv2.LINE_AA)
+                        cv2.putText(panels[0], msg, (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    col, 1, cv2.LINE_AA)
+                        cv2.imshow(f"warp_lines_cam{ci}", np.vstack(panels))
+                    else:
+                        cv2.imshow(f"warp_lines_cam{ci}", np.vstack([warped, line_viz]))
                     if args.hands_debug and ci in hand_gates:
                         cv2.imshow(f"hand_warped_debug_cam{ci}",
                                    hand_gates[ci].draw_warped_debug(warped))
@@ -529,7 +697,12 @@ def main():
                     keys_dict, warped_img, _ = res
                     overlays[ci] = overlay_from_dict(keys_dict)
                     pending_keys[ci] = keys_dict
-                    detectors[ci] = Detector(keys_dict)
+                    detectors[ci] = Detector(keys_dict, smooth_window=args.smooth_window, use_mediapipe=args.mediapipe, use_diff_only=args.diff)
+                    if args.diff:
+                        detectors[ci].set_diff_thresholds(args.diff_press_pixels, args.diff_min_blob_area)
+                        detectors[ci].set_diff_boundary_margin(args.diff_boundary_margin)
+                    if args.transcribe:
+                        transcribe_luts[ci] = _build_transcribe_lut(keys_dict)
                     if args.hand_gate:
                         from calibration import save_calibration, Calibration
                         from hand_gate import HandGate
@@ -569,7 +742,12 @@ def main():
                     keys_dict, warped_img, _ = res
                     overlays[ci] = overlay_from_dict(keys_dict)
                     pending_keys[ci] = keys_dict
-                    detectors[ci] = Detector(keys_dict)
+                    detectors[ci] = Detector(keys_dict, smooth_window=args.smooth_window, use_mediapipe=args.mediapipe, use_diff_only=args.diff)
+                    if args.diff:
+                        detectors[ci].set_diff_thresholds(args.diff_press_pixels, args.diff_min_blob_area)
+                        detectors[ci].set_diff_boundary_margin(args.diff_boundary_margin)
+                    if args.transcribe:
+                        transcribe_luts[ci] = _build_transcribe_lut(keys_dict)
                     if args.hand_gate:
                         from calibration import save_calibration, Calibration
                         from hand_gate import HandGate
@@ -599,7 +777,19 @@ def main():
                     print("no detection state — press 'c' or pass --keys first")
                 else:
                     det_enabled = not det_enabled
-                    print(f"detect: {det_enabled}  threshold={det_threshold}")
+                    if args.diff:
+                        any_det = next(iter(detectors.values()))
+                        print(
+                            f"detect: {det_enabled}  "
+                            f"press_pix={any_det._diff_press_pixel_count}  "
+                            f"min_blob={any_det._diff_min_blob_area}  "
+                            f"bnd={any_det._diff_boundary_margin}"
+                        )
+                    else:
+                        print(
+                            f"detect: {det_enabled}  "
+                            f"margin_blk={args.diff_press_pixels if args.diff else 'n/a'}"
+                        )
             elif k == ord("b"):
                 # Two-phase baseline capture:
                 #   Phase 1 (rest):  30 frames, hands AWAY → rest mean,
@@ -648,6 +838,15 @@ def main():
             print(f"final: {rec_idx} frames in {rec_dir}")
         for hg in hand_gates.values():
             hg.close()
+        if transcriber is not None:
+            midi_dir = Path("midi_outs")
+            midi_dir.mkdir(exist_ok=True)
+            midi_path = midi_dir / time.strftime("%Y%m%d_%H%M%S.mid")
+            try:
+                transcriber.save_midi(str(midi_path))
+                print(f"saved MIDI to {midi_path}")
+            except Exception as e:
+                print(f"transcriber save_midi failed: {e}")
         for s in streams:
             s.stop()
         cv2.destroyAllWindows()

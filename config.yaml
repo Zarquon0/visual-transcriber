@@ -5,4 +5,4 @@ resolution:
 # Frame rate (fps). Set to null to leave at camera default (30).
 fps: null
 
-soundfont: "" #"FluidR3_GM_GS.sf2"
+soundfont: "FluidR3_GM_GS.sf2"
