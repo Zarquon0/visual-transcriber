@@ -96,6 +96,12 @@ class Detector:
         self.types = [k["type"] for k in keys_dict["keys"]]
         self.n_keys = len(self.types)
         self.is_black = np.array([t == "black" for t in self.types])
+        # Camera-far direction (from calibration). Used in diff-mode to
+        # break boundary-blob ties by cam side: a blob spanning two
+        # adjacent keys goes to the cam-near neighbor (rightmost touched
+        # for far_side="left" / right cam; leftmost for far_side="right"
+        # / left cam). Replaces area-based argmax assignment.
+        self._far_side = str(keys_dict.get("far_side", "right"))
 
         self.smooth_window = max(1, smooth_window)
         self.debounce = max(1, debounce)
@@ -119,13 +125,13 @@ class Detector:
         # whatever survives the strict filter, not a fraction of polygon.
         self._diff_min_blob_area = 1       # 1 = disabled (no CC filter)
         self._diff_press_pixel_count = 20  # per-key activated-pixel threshold
-        # Boundary margin (px) for diff-mode pixel→key assignment. The
-        # base key_id_map is unerooded (pixels right up to the polygon
-        # edge belong to that key); for adjacent keys this means a press
-        # blob bridging the seam can be split between them and trigger
-        # both. We rebuild a more-eroded id-map for diff scoring so a
-        # ribbon along every polygon boundary becomes "no key".
-        self._diff_boundary_margin = 1
+        # Boundary margin (px) for diff-mode pixel→key assignment.
+        # ZERO by default: no erosion, no inter-key gap. Boundary-spanning
+        # blobs are resolved by the camera-side rule in _process_diff
+        # (right cam → rightmost touched key; left cam → leftmost) — the
+        # geometric decision is which cam sees the keyboard from which
+        # side, so we don't need a buffer ribbon.
+        self._diff_boundary_margin = 0
         # Frame-to-frame motion supplement to the MP hand mask. Catches
         # fast sweeps where MP loses tracking. Threshold is on absolute
         # gray-channel delta; press onset is small (<20), hand sweep is
@@ -1063,17 +1069,19 @@ class Detector:
 
         # ── Per-key score via BLOB-TO-KEY assignment ─────────────────
         # Connected components on the post-hand mask. Each blob is
-        # assigned to a SINGLE key (the one whose polygon contains the
-        # most of its pixels); the key's count is just that blob's
-        # in-polygon portion. Adjacent keys that share a few pixels of
-        # the blob via boundary leakage get 0 from it. Result: one
-        # press blob → one key fires, no cross-firing.
+        # assigned to a SINGLE key by CAMERA-SIDE rule (geometric, not
+        # area-based). For a right cam (far_side="left") the blob goes
+        # to the rightmost touched key; for a left cam (far_side="right")
+        # the leftmost. This leverages each cam's near-side polygon
+        # accuracy and gives one press blob → one key, no cross-firing,
+        # no lost pixels in any boundary gap.
         key_id = self._diff_key_id_map
         counts = np.zeros(self.n_keys, dtype=np.float32)
         if act_bool.any():
             n_lab, lbl = cv2.connectedComponents(
                 act_bool.astype(np.uint8), connectivity=8,
             )
+            pick_rightmost = (self._far_side == "left")
             for ci in range(1, n_lab):
                 blob_mask = (lbl == ci)
                 blob_ids = key_id[blob_mask]
@@ -1081,7 +1089,10 @@ class Detector:
                 if blob_ids.size == 0:
                     continue
                 per_key_in_blob = np.bincount(blob_ids, minlength=self.n_keys)
-                best = int(per_key_in_blob.argmax())
+                touched = np.where(per_key_in_blob > 0)[0]
+                if touched.size == 0:
+                    continue
+                best = int(touched.max() if pick_rightmost else touched.min())
                 counts[best] += float(per_key_in_blob[best])
         # Counted-mask viz: pixels that survive both hand exclusion and
         # the boundary ribbon — the signal feeding the per-key argmax.

@@ -90,8 +90,6 @@ def calibrate_from_frame(cfg, frame, far_side="right", camera_id="live"):
         return None, None
     keys_dict, calib_warped, _ = result
     print(f"calibrated [{camera_id}]: {len(keys_dict['keys'])} keys (far_side={far_side})")
-    cv2.imshow(f"warp_{camera_id}",
-               np.vstack([calib_warped, draw_warp_colored(calib_warped, keys_dict)]))
     return keys_dict, calib_warped
 
 
@@ -131,8 +129,13 @@ def build_hand_gate(cfg, keys_dict):
 
 # ── Visualization ───────────────────────────────────────────────────────
 
-def build_warp_lines_panels(detector, keys_dict, warped, pressed):
-    """The 7-panel pipeline diagnostic stack."""
+def build_warp_lines_panels(detector, keys_dict, warped, pressed, cam_role=None):
+    """The 7-panel pipeline diagnostic stack.
+
+    ``cam_role`` (optional, e.g. "LEFT CAM") prefixes the top panel's
+    label so dual-cam users can immediately tell which window is which
+    physical camera.
+    """
     warp_with_press = warped.copy()
     for ki in pressed:
         try:
@@ -143,8 +146,10 @@ def build_warp_lines_panels(detector, keys_dict, warped, pressed):
                              (0, 0, 255), 3, cv2.LINE_AA)
         except Exception:
             pass
+    far_side = keys_dict.get("far_side", "right")
+    role_prefix = f"[{cam_role} | far={far_side}] " if cam_role else ""
     panels = [
-        _label_panel(warp_with_press, "1. RAW WARP + PRESSES"),
+        _label_panel(warp_with_press, f"{role_prefix}1. RAW WARP + PRESSES"),
         _label_panel(draw_warp_colored(warped, keys_dict), "2. SEGMENTATION"),
         _label_panel(detector._last_hand_viz, "3. HAND MASK (MP)"),
     ]
@@ -422,7 +427,18 @@ def detect_until_quit_or_recalib_dual(cfg, stream, detectors, transcriber, key_l
             for ci in range(2):
                 polys_src, sbb_src, types = overlays[ci]
                 d = draw_overlay_with_pressed(frames[ci], polys_src, sbb_src, types, fused_pressed)
-                disps.append(_resize_to_height(d, 540))
+                d = _resize_to_height(d, 540)
+                # Cam role indicator stamped at top-center of each half.
+                role = ("LEFT CAM" if cfg.far_sides[ci] == "right"
+                        else "RIGHT CAM")
+                role_text = f"{role}  (far={cfg.far_sides[ci]})"
+                (tw, _), _ = cv2.getTextSize(role_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                tx = max(10, (d.shape[1] - tw) // 2)
+                cv2.putText(d, role_text, (tx, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(d, role_text, (tx, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (0, 220, 255), 1, cv2.LINE_AA)
+                disps.append(d)
             composite = np.hstack(disps)
             if bl_active:
                 _hud(composite, [
@@ -437,9 +453,12 @@ def detect_until_quit_or_recalib_dual(cfg, stream, detectors, transcriber, key_l
                 ])
             cv2.imshow("piano", composite)
             for ci in range(2):
+                role = ("LEFT CAM" if cfg.far_sides[ci] == "right"
+                        else "RIGHT CAM")
                 cv2.imshow(f"warp_lines_cam{ci}",
                            build_warp_lines_panels(detectors[ci], keys_dicts[ci],
-                                                   warpeds[ci], per_cam_pressed[ci]))
+                                                   warpeds[ci], per_cam_pressed[ci],
+                                                   cam_role=role))
 
             k = cv2.waitKey(1) & 0xFF
             if k == 27:
