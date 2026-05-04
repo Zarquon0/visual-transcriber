@@ -29,12 +29,23 @@ from key_labeler import draw_labels_tight_crop
 from calibration import build_calibration_data, save_calibration
 
 
-def calibrate_frame(frame: np.ndarray, top_crop: int = 0, camera_id: str = "live"):
+def calibrate_frame(
+    frame: np.ndarray,
+    top_crop: int = 0,
+    camera_id: str = "live",
+    far_side: str = "right",
+):
     """Auto-detect corners → warp → build keys.json dict (in-process, no IO).
 
     Returns (keys_dict, warped_img, corners) or None if detection failed.
     top_crop trims pixels off the top of the warped strip first; the
     returned corners are recomputed so the dict's warp matches the trim.
+
+    far_side: which direction the camera looks AWAY from the keyboard.
+    Side-view cams from the left of the keyboard see camera-far on the
+    right ("right", default); cams on the right see camera-far on the
+    left ("left"). Affects which side's outer-piece contour gets
+    projected onto inner pieces in merged-blob splitting.
     """
     warped, warp_trans, corners = warp_to_piano(frame, debug=False)
     if warp_trans is None or corners is None or warped.size == 0:

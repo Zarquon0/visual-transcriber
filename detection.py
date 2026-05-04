@@ -1034,6 +1034,13 @@ class Detector:
 
         # press_diff filter: absdiff vs rest-mean → threshold@75 → top-frame blob filter.
         raw_act = detect_press_regions(warped_bgr, self._rest_mean_bgr)
+        # Hard-chop everything below the top 15 % of the warp. press_diff's
+        # filter_blobs_by_top_presence keeps WHOLE blobs that touch the
+        # top band — including pixels below — which can leak press
+        # signal into white-key seam areas. This drops everything below
+        # the top band regardless of what those pixels are attached to.
+        top_band = max(1, int(raw_act.shape[0] * 0.15))
+        raw_act[top_band:, :] = 0
         self._last_diff_raw_mask = raw_act.copy()
         act_bool = raw_act > 0
         if hand_mask is not None and hand_mask.size:
@@ -1054,18 +1061,30 @@ class Detector:
 
         self._last_diff_post_hand_mask = (act_bool.astype(np.uint8) * 255)
 
-        # Per-key activated-pixel COUNT via the diff-eroded key id map.
-        # Each activated pixel is assigned to a single key OR to the
-        # boundary ribbon (-1, ignored). Vectorized via bincount.
+        # ── Per-key score via BLOB-TO-KEY assignment ─────────────────
+        # Connected components on the post-hand mask. Each blob is
+        # assigned to a SINGLE key (the one whose polygon contains the
+        # most of its pixels); the key's count is just that blob's
+        # in-polygon portion. Adjacent keys that share a few pixels of
+        # the blob via boundary leakage get 0 from it. Result: one
+        # press blob → one key fires, no cross-firing.
         key_id = self._diff_key_id_map
-        ids_in_act = key_id[act_bool]
-        valid_pix_mask = ids_in_act >= 0
-        ids_valid = ids_in_act[valid_pix_mask]
-        counts = np.bincount(
-            ids_valid, minlength=self.n_keys
-        ).astype(np.float32)
-        # Counted-mask viz: pixels that survive BOTH hand exclusion and
-        # the boundary ribbon — the actual signal feeding press counts.
+        counts = np.zeros(self.n_keys, dtype=np.float32)
+        if act_bool.any():
+            n_lab, lbl = cv2.connectedComponents(
+                act_bool.astype(np.uint8), connectivity=8,
+            )
+            for ci in range(1, n_lab):
+                blob_mask = (lbl == ci)
+                blob_ids = key_id[blob_mask]
+                blob_ids = blob_ids[blob_ids >= 0]
+                if blob_ids.size == 0:
+                    continue
+                per_key_in_blob = np.bincount(blob_ids, minlength=self.n_keys)
+                best = int(per_key_in_blob.argmax())
+                counts[best] += float(per_key_in_blob[best])
+        # Counted-mask viz: pixels that survive both hand exclusion and
+        # the boundary ribbon — the signal feeding the per-key argmax.
         counted_bool = act_bool & (key_id >= 0)
         self._last_diff_counted_mask = (
             counted_bool.astype(np.uint8) * 255

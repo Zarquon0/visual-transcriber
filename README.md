@@ -166,10 +166,11 @@ The current primary detection path is **`--diff`** (William's `press_diff.detect
 
 **Two equivalent live entry points:**
 
-- **`main.py`** — simplified single-camera live pipeline. SPACE to calibrate, `c` to recalibrate live, `b` to recapture baseline, ESC to save MIDI. All hyperparameters as constants at the top of the file. **Recommended for normal play.**
+- **`main.py`** — simplified live pipeline (single- or dual-camera). SPACE to calibrate, `c` to recalibrate live, `b` to recapture baseline, ESC to save MIDI. All hyperparameters as constants at the top of `main.py`. **Recommended for normal play.**
   ```bash
   uv run python main.py
   ```
+  All orchestration helpers live in **`pipeline.py`**; `main.py` is just the config + a high-level `run_single` / `run_dual` that read top-down (open stream → preview → SPACE calibrates → build Detector / HandGate / Transcriber → detection loop → save MIDI on ESC).
 
 - **`record.py`** — dev-mode equivalent with full CLI surface, recording capability, and live tuning hotkeys (`1`/`2` press_pix, `3`/`4` min_blob, `5`/`6` boundary, `m` motion supp). Used during pipeline tuning.
   ```bash
@@ -179,6 +180,10 @@ The current primary detection path is **`--diff`** (William's `press_diff.detect
       --diff-press-pixels 5 --diff-min-blob-area 1 --diff-boundary-margin 1 \
       --smooth-window 1 --transcribe
   ```
+
+**Dual-camera mode** (`DUAL_CAM = True` in `main.py`): synced `DualCanonStream` reads both Canons; SPACE calibrates each independently with its own `far_side`; per-cam Detectors run in **parallel threads** (MediaPipe releases the GIL during inference, so two `.detect()` calls overlap). Per-frame press sets are fused via **union + per-key TTL hold-over** — any cam firing a key keeps it alive for `DUAL_CAM_TEMPORAL_WINDOW` (3) more frames, bridging brief inter-cam gaps. The unified `fused_pressed` set drives a single shared Transcriber + the red press flashes on both cam panels. (A weighted-vote fusion is also available in `pipeline.fuse_dual` / `per_cam_weights` if needed later.)
+
+> **Note on MediaPipe usage in dual mode**: HandGate is intentionally **disabled** in dual mode (`cfg.hand_gate = False` at the top of `run_dual`). Reason: HandGate runs its own MP Hand Landmarker inference, separate from the Detector's own MP-aware hand mask — that's 4 MP calls per frame in dual (2× Detector + 2× HandGate), pushing per-frame work over the 33 ms budget at 30 fps. The Detector's MP hand mask already excludes hand pixels in the diff path, which is the dominant guard. **Future cleanup**: collapse the two parallel MP pipelines into one — run MediaPipe once per cam (via HandGate or Detector, not both), expose its 21-landmark output to both consumers, and eliminate the redundant inference. Either ignore HandGate's MP entirely (rely on Detector's) or refactor HandGate to consume Detector's already-computed landmarks. Saves ~25 ms / cam / frame.
 
 > **Pre-flight:** `brew install fluidsynth` (one-time), `uv sync`, drop a `.sf2` in `sound_fonts/` (we use `FluidR3_GM_GS.sf2`), set the macOS audio output device (System Settings → Sound or menu-bar volume icon) **before** launching — fluidsynth captures whichever device is default at startup and won't reroute mid-session.
 
@@ -236,6 +241,15 @@ uv run python playback.py recordings/1777663914_press \
 | `--debounce` | 1 (rec) / 3 (pb) | **1** (rec) / **1** (pb) | Frames a key must stay above threshold. 1 = instant. |
 
 These are all intentionally aggressive; press_diff's strict threshold-75 + top-frame blob filter means surviving activation is rarely noise.
+
+**Per-frame scoring (current algo):**
+
+1. `press_diff.detect_press_regions(warped, baseline_bgr)` — William's filter: absdiff vs. rest baseline → threshold ≥75 → keep blobs touching top 15% of warp.
+2. **Hard top-band chop** — additionally zero out everything below the top 15 % of the warp regardless of blob connectivity. press_diff's filter retains *whole* blobs that touch the top band (including pixels below); we drop those bottom pixels too, since they tend to leak into white-key-seam areas and confuse per-key assignment.
+3. AND-NOT MediaPipe hand mask (Detector's own MP inference, with bulky bone + joint + fingertip + wrist caps + 65×65 dilation).
+4. **Connected-components on the post-hand mask** + **blob-to-key `argmax`** assignment: each connected component is assigned to the *single* key polygon containing the most of its in-polygon pixels. Adjacent keys get **0** from that blob. Result: one peak → one key, no cross-firing on boundary leakage.
+5. The chosen key's count is the blob's in-polygon pixel total; smoothed over `--smooth-window` frames; a key fires when count > `--diff-press-pixels` for `--debounce` consecutive frames.
+6. (Dual-cam) Per-cam press sets are unioned; a per-key TTL keeps each key alive for `DUAL_CAM_TEMPORAL_WINDOW` frames after either cam drops it.
 
 **Why ``--mediapipe``:** the hand mask. With it on, MP runs on every frame's extended warp, finds 21-landmark hand skeletons + convex hull, projects them into warped coords, and AND-NOT's them out of the activation mask before per-key counting.
 
