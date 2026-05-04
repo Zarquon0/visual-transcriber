@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+import yaml
 import fluidsynth
 import mido
 
@@ -40,7 +41,22 @@ class _NoteEvent:
     start_time: float  # seconds from first update call
     duration: float    # seconds
 
-_SOUNDFONT = Path(__file__).parent / "sound_fonts" / "FluidR3_GM_GS.sf2"
+def _resolve_soundfont() -> Path:
+    sf_dir = Path(__file__).parent / "sound_fonts"
+    config_path = Path(__file__).parent / "config.yaml"
+    name: str = ""
+    if config_path.exists():
+        with config_path.open() as f:
+            cfg = yaml.safe_load(f) or {}
+        name = (cfg.get("soundfont") or "").strip()
+    if name:
+        candidate = sf_dir / name
+        if candidate.exists():
+            return candidate
+    files = sorted(sf_dir.glob("*"))
+    if not files:
+        raise FileNotFoundError(f"No soundfont files found in {sf_dir}")
+    return files[0]
 
 class Transcriber:
     def __init__(self, fps: float = 30, audio_driver: str = "coreaudio"):
@@ -54,7 +70,7 @@ class Transcriber:
 
         self._fs = fluidsynth.Synth()
         self._fs.start(driver=audio_driver)
-        sfid = self._fs.sfload(str(_SOUNDFONT))
+        sfid = self._fs.sfload(str(_resolve_soundfont()))
         self._fs.program_select(0, sfid, 0, 0)
 
     def update(self, keys: list[Key]) -> None:

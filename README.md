@@ -16,7 +16,7 @@ uv run python <script>
 
 If one or more video streams are missing, you can try using `cam_probe.py` and `cam_identify.py` to debug. `stream_webcams.py` should automatically find and detect connected Canon cameras, but this functionality has not been thoroughly tested.
  
-To change the image resolution or FPS (maybe - not sure FPS control works), alter the values in the `camera_config.yaml` file.
+To change the image resolution or FPS (maybe - not sure FPS control works), alter the values in the `config.yaml` file.
 
 ### Synced Dual Canon Camera Streaming
 For synced dual camera streaming, use the DualCanonStream object in `stream_webcams.py`. The `read()` method in the object allows you to read the most recent synced frames from the two cameras. Look to the `if __name__=="__main__":` in `stream_webcams.py` for a usage example.

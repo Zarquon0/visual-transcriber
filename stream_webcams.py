@@ -8,7 +8,7 @@ import yaml
 import threading
 
 
-_CONFIG_PATH = Path(__file__).parent / "camera_config.yaml"
+_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
 
 def _load_config(path: Path = _CONFIG_PATH) -> dict:
