@@ -7,6 +7,14 @@ To run scripts:
 ```
 uv run python <script>
 ```
+### Additional Setup for Transcriber Usage
+The `Transcriber` object in `transcriber.py` enables live playing through an external synthesizer. To get live playing to work:
+```zsh
+# On Mac
+brew install fluidsynth
+```
+Additionally, you'll need at least one sound font file in `sound_fonts/`. One good option is [here](https://musical-artifacts.com/artifacts/1229/FluidR3_GM_GS.sf2). Feel free to add multiple sound fonts to this folder, you may optionally specify which one to use in `config.yaml`.
+
 ## Webcam Streaming
 `stream_webcams.py` creates cv2 connections to attached Canon R50 cameras. To properly connect cameras:
 
