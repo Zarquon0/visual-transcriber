@@ -164,17 +164,25 @@ A live recording + offline playback workflow on top of the existing calibration 
 
 The current primary detection path is **`--diff`** (William's `press_diff.detect_press_regions` for the activation mask, MediaPipe for the hand mask, per-key absolute pixel-count scoring with boundary erosion). Use `--mediapipe` alongside `--diff` so hands are excluded properly. `--transcribe` plugs the press events into a soundfont synth + MIDI recorder.
 
-**Live capture + detection + audio from a Canon camera (the actual flow we use):**
+**Two equivalent live entry points:**
 
-```bash
-uv run python record.py --no-iphone --cam-index 0 \
-    --keys recordings/_snapshots/calib_<timestamp>_cam0_keys.json \
-    --mediapipe --diff \
-    --diff-press-pixels 5 --diff-min-blob-area 1 --diff-boundary-margin 1 \
-    --smooth-window 1 --transcribe
-```
+- **`main.py`** — simplified single-camera live pipeline. SPACE to calibrate, `c` to recalibrate live, `b` to recapture baseline, ESC to save MIDI. All hyperparameters as constants at the top of the file. **Recommended for normal play.**
+  ```bash
+  uv run python main.py
+  ```
+
+- **`record.py`** — dev-mode equivalent with full CLI surface, recording capability, and live tuning hotkeys (`1`/`2` press_pix, `3`/`4` min_blob, `5`/`6` boundary, `m` motion supp). Used during pipeline tuning.
+  ```bash
+  uv run python record.py --no-iphone --cam-index 0 \
+      --keys recordings/_snapshots/calib_<timestamp>_cam0_keys.json \
+      --mediapipe --diff \
+      --diff-press-pixels 5 --diff-min-blob-area 1 --diff-boundary-margin 1 \
+      --smooth-window 1 --transcribe
+  ```
 
 > **Pre-flight:** `brew install fluidsynth` (one-time), `uv sync`, drop a `.sf2` in `sound_fonts/` (we use `FluidR3_GM_GS.sf2`), set the macOS audio output device (System Settings → Sound or menu-bar volume icon) **before** launching — fluidsynth captures whichever device is default at startup and won't reroute mid-session.
+
+> **macOS Reactions warning:** macOS Sonoma+ has system-level **Camera Reactions** that overlay balloons / hearts / fireworks etc. on the camera feed when it sees gestures like thumbs-up or peace-signs. These are applied upstream of OpenCV — they corrupt the frames our pipeline receives, breaking warp / segmentation / hand mask / press detection. **Disable via Control Center → Video Effects → Reactions OFF while the camera is in use.**
 
 Then in the recorder window:
 1. Press **`c`** — auto-calibrate to current camera position. HUD shows `61 keys (b:25 w:36, labeled:61)` on success. The transcribe note-LUT is rebuilt from the calibration's note labels.
@@ -189,11 +197,17 @@ Then in the recorder window:
 uv run python playback.py recordings/1777663914_press \
     --mediapipe --diff \
     --diff-press-pixels 5 --diff-min-blob-area 1 --diff-boundary-margin 1 \
-    --smooth-window 3 --debounce 1 \
+    --smooth-window 2 --debounce 1 \
     --transcribe
 ```
 
-**The seven `warp_lines` panels** (top → bottom, both record.py `d` mode and playback.py):
+**main.py hotkeys** (focus the `piano` window):
+- `SPACE` calibrate (preview phase) → starts detection
+- `c` recalibrate from current frame (during detection)
+- `b` recapture REST baseline over `BASELINE_FRAMES` (60) quiet frames — hands AWAY
+- `ESC` save MIDI to `midi_outs/<timestamp>.mid` and quit
+
+**The seven `warp_lines` panels** (top → bottom — same in main.py, record.py's `d` mode, and playback.py):
 
 1. **RAW WARP + PRESSES** — pressed keys outlined red on the warped strip.
 2. **SEGMENTATION** — colored key polygons over the warp (calibration sanity check).

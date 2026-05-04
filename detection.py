@@ -615,7 +615,19 @@ class Detector:
     # the fleshy tip past MP's nail-joint landmark on typical warp sizes
     # (640-1280 wide). Tunable; larger = safer at cost of masking more
     # adjacent key-surface pixels (which lose press-signal contribution).
-    _FINGERTIP_CAP_RADIUS = 28
+    _FINGERTIP_CAP_RADIUS = 35
+    # Filled-circle cap at the wrist landmark (index 0). Roughly 2× the
+    # fingertip radius — wrist + forearm extends far past the convex hull
+    # of the 21 hand landmarks and routinely leaks through without it.
+    _WRIST_CAP_RADIUS = 60
+    # Filled-circle cap at every one of the 21 landmarks. Thickens the
+    # finger-skeleton beyond just the bone lines + convex hull, so that
+    # the silhouette of each finger is reliably masked even at narrow
+    # joints / splayed-finger poses.
+    _JOINT_CAP_RADIUS = 20
+    # Bone-line thickness for the skeleton render. Larger = more finger
+    # coverage before final dilation.
+    _BONE_THICKNESS = 8
 
     def _mediapipe_search_region(self, warped_shape):
         """Returns a generous binary search region around hand bones in
@@ -693,10 +705,22 @@ class Detector:
             pts_warped = cv2.perspectiveTransform(
                 pts_ext.reshape(-1, 1, 2), self._mp_ext_to_orig,
             ).reshape(-1, 2).astype(np.int32)
+            # Skeleton bones — thick enough that the bones alone cover
+            # most of each finger's actual silhouette before any further
+            # dilation.
             for a, b in self._MP_HAND_CONNECTIONS:
                 cv2.line(
                     skeleton, tuple(pts_warped[a]), tuple(pts_warped[b]),
-                    255, thickness=3, lineType=cv2.LINE_AA,
+                    255, thickness=self._BONE_THICKNESS, lineType=cv2.LINE_AA,
+                )
+            # Joint caps at every one of the 21 landmarks. Filled circles
+            # plug any gaps the bone lines + convex hull leave at sharp
+            # finger bends and around small joints.
+            for ji in range(len(pts_warped)):
+                cv2.circle(
+                    skeleton, tuple(pts_warped[ji]),
+                    self._JOINT_CAP_RADIUS,
+                    255, thickness=-1, lineType=cv2.LINE_AA,
                 )
             # Convex hull of all 21 landmarks fills the inter-finger webbing
             # and palm interior naturally — strictly more inclusive than
@@ -720,12 +744,23 @@ class Detector:
                     self._FINGERTIP_CAP_RADIUS,
                     255, thickness=-1, lineType=cv2.LINE_AA,
                 )
+            # Wrist cap. The wrist landmark (index 0) is at the topology
+            # edge — convex hull rarely extends much past it, so wrist /
+            # forearm pixels routinely leak past the mask. A generous
+            # filled circle (~2× fingertip radius) covers the bulk of
+            # wrist + lower palm reliably.
+            cv2.circle(
+                skeleton,
+                tuple(pts_warped[0]),
+                self._WRIST_CAP_RADIUS,
+                255, thickness=-1, lineType=cv2.LINE_AA,
+            )
         self._last_fingertip_caps = fingertip_caps
         # Dilate to a generous search region (covers any plausible finger
-        # / palm thickness for the camera angle without committing to a
-        # specific number).
+        # / palm / wrist thickness for the camera angle without committing
+        # to a specific number).
         return cv2.dilate(
-            skeleton, cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
+            skeleton, cv2.getStructuringElement(cv2.MORPH_RECT, (65, 65))
         )
 
     def _compute_hand_mask(self, warped_bgr: np.ndarray, warped_gray: np.ndarray):
