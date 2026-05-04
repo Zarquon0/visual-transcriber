@@ -80,3 +80,67 @@ if segments is not None and len(segments) > 0:
 
     
 """
+
+# from ultralytics import YOLO
+# def segment_hands(frame):
+#     # Run inference. 'classes=[0]' limits detection to 'person' 
+#     # (which includes hands/arms in many datasets)
+#     model = YOLO('yolov8n-seg.pt')
+#     results = model.predict(frame, conf=0.5, classes=[0])
+    
+#     # Create an empty mask for the hands
+#     hand_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    
+#     for r in results:
+#         if r.masks is not None:
+#             # Extract the binary masks for each detected hand
+#             for mask in r.masks.data:
+#                 # Convert the tensor to a numpy array and resize to frame size
+#                 m = mask.cpu().numpy()
+#                 m = cv2.resize(m, (frame.shape[1], frame.shape[0]))
+#                 hand_mask[m > 0] = 255
+                
+#     return hand_mask
+
+# if __name__ == "__main__":
+#     # pics_to_piano(sys.argv[1:] if len(sys.argv) > 1 else [
+#     #     "piano_photos/IMG_9064.jpg",
+#     #     "piano_photos/IMG_9066.jpg",
+#     #     "piano_photos/IMG_9073.jpg",
+#     # ])
+#     img = load_image("./piano_photos/keypress.png")
+#     white_balanced = white_balance(img)
+#     # ycrcb = cv2.cvtColor(white_balanced, cv2.COLOR_BGR2YCrCb)
+#     # # mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+#     # #mask = segment_hands(img)
+#     # # cv2.imshow("white_balanced", white_balanced)
+#     # # cv2.imshow("ycrcb", ycrcb)
+#     # # Split into individual components
+#     # y_chan, cr_chan, cb_chan = cv2.split(ycrcb) 
+#     # # Display them separately
+#     # cv2.imshow("1_Luminance_Y", y_chan)   # Looks like a grayscale version of the keyboard
+#     # cv2.imshow("2_RedDiff_Cr", cr_chan)    # Fingers should be BRIGHT WHITE, keys/shadows DARK
+#     # cv2.imshow("3_BlueDiff_Cb", cb_chan)   # Fingers should be DARK or mid-gray
+#     # cv2.waitKey(0)
+#     isolate_white_all_peaks(white_balanced)
+
+# def stream_to_piano_steady(stream: CanonStream, window_name: str = "keyboard_stream"):
+#     stream.start()
+#     corners = None
+#     count = 0
+#     while True:
+#         grabbed, frame = stream.read()
+#         if not grabbed or frame is None:
+#             print("Failed to read from camera")
+#             break
+#         if corners is None or count >= 100:
+#             warped, _, corners = warp_to_piano(frame, debug=True)
+#             corners = corners
+#             count += 1
+#         else:
+#             warped = warp_from_corners(frame, corners)
+#         cv2.imshow("warped", warped)
+#         if cv2.waitKey(1) & 0xFF == 27:
+#             break
+#     stream.stop()
+#     cv2.destroyAllWindows()

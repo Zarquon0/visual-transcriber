@@ -116,9 +116,14 @@ def isolate_diff_peak(gray: np.ndarray) -> np.ndarray:
     mask = (g >= 75)
     return np.where(mask, 255, 0).astype(np.uint8)
 
-def process_diff(diff: np.ndarray) -> np.ndarray:
+def detect_press_regions(live_warped: np.ndarray, stored_warped: np.ndarray) -> np.ndarray:
+    diff = cv2.absdiff(
+        cv2.cvtColor(stored_warped, cv2.COLOR_BGR2GRAY),
+        cv2.cvtColor(live_warped,        cv2.COLOR_BGR2GRAY),
+    )
     isolated = isolate_diff_peak(diff)
     return filter_blobs_by_top_presence(isolated)
+
 
 
 def stream_diff(stream: CanonStream, window_name: str = "diff_stream"):
@@ -144,11 +149,7 @@ def stream_diff(stream: CanonStream, window_name: str = "diff_stream"):
             first_rail = np.concatenate([corners[0], corners[1]])
             second_rail = np.concatenate([corners[2], corners[3]])
             _, warped = warp_key_lines(frame, first_rail, second_rail)
-            diff = cv2.absdiff(
-                cv2.cvtColor(stored_warped, cv2.COLOR_BGR2GRAY),
-                cv2.cvtColor(warped,        cv2.COLOR_BGR2GRAY),
-            )
-            cv2.imshow(window_name, process_diff(diff))
+            cv2.imshow(window_name, detect_press_regions(warped, stored_warped))
             cv2.imshow("warped", warped)
             if cv2.waitKey(1) & 0xFF == 27:
                 break

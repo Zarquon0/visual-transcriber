@@ -11,4 +11,5 @@ dependencies = [
     "opencv-python>=4.13.0.92",
     "pillow>=12.2.0",
     "pyyaml>=6.0.3",
+    "ultralytics>=8.4.46",
 ]

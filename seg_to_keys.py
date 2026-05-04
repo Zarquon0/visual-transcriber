@@ -3,6 +3,7 @@ import numpy as np
 from PIL import Image
 import sys
 from stream_webcams import CanonStream, open_canon_streams
+#from manual_calibrate import warp_from_corners
 
 #
 # Hyperparameters
@@ -10,6 +11,7 @@ from stream_webcams import CanonStream, open_canon_streams
 
 #BRIGHTNESS_THRESHOLD = 0.6 # brightness threshold for white detection
 WHITE_PEAK_TOLERANCE = 30  # ±pixel value tolerance around each channel's brightest histogram peak
+PEAK_NEIGHBORHOOD    = 5  # a histogram point must exceed all points within this many bins to count as a peak
 
 GAUSSIAN_KERNEL   = (5, 5)   # blur kernel size (must be odd)
 GAUSSIAN_SIGMA    = 1.0      # blur sigma
@@ -66,6 +68,40 @@ def _draw_hist_debug(smoothed: np.ndarray, peak: int) -> np.ndarray:
     cv2.putText(vis, label, (min(px + 4, W - 180), pad_t + 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
     # X-axis
+    cv2.line(vis, (0, H - pad_b), (W - 1, H - pad_b), (160, 160, 160), 1)
+    for v in [0, 64, 128, 192, 255]:
+        x = int(round(v * (W - 1) / 255))
+        cv2.line(vis, (x, H - pad_b), (x, H - pad_b + 4), (160, 160, 160), 1)
+        cv2.putText(vis, str(v), (x - 8, H - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1, cv2.LINE_AA)
+    return vis
+
+def _draw_hist_debug_all_peaks(smoothed: np.ndarray, peaks: list[int]) -> np.ndarray:
+    """Render the L-channel smoothed histogram with every peak marked and labeled by index."""
+    W, H = 512, 256
+    pad_b, pad_t = 24, 12
+    vis = np.full((H, W, 3), 20, dtype=np.uint8)
+    plot_h = H - pad_b - pad_t
+    max_val = smoothed.max()
+    if max_val == 0:
+        return vis
+    pts = np.array([
+        (int(round(i * (W - 1) / 255)),
+         pad_t + plot_h - int(round(smoothed[i] / max_val * plot_h)))
+        for i in range(256)
+    ], dtype=np.int32)
+    cv2.polylines(vis, [pts], False, (200, 200, 200), 1, cv2.LINE_AA)
+    peak_colors = [(0, 255, 255), (255, 165, 0), (255, 0, 255), (0, 255, 0), (0, 128, 255)]
+    label_y_offsets = [18, 34, 50, 66, 82]
+    for idx, peak in enumerate(peaks):
+        color = peak_colors[idx % len(peak_colors)]
+        px = int(round(peak * (W - 1) / 255))
+        cv2.line(vis, (px, pad_t), (px, H - pad_b), color, 2)
+        label = f'{idx}: L={peak}'
+        tx = min(px + 4, W - 80)
+        ty = pad_t + label_y_offsets[idx % len(label_y_offsets)]
+        cv2.putText(vis, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
     cv2.line(vis, (0, H - pad_b), (W - 1, H - pad_b), (160, 160, 160), 1)
     for v in [0, 64, 128, 192, 255]:
         x = int(round(v * (W - 1) / 255))
@@ -492,10 +528,10 @@ def pics_to_piano(paths: list[str], window_name: str = "keyboard_stream"):
         cv2.imshow(window_name, warped)
         cv2.waitKey(0)
 
-# if __name__ == "__main__":
-#     streams = open_canon_streams(allow_iphone=False, silent=False)
-#     for stream in streams:
-#         stream_to_piano(stream)
+if __name__ == "__main__":
+    streams = open_canon_streams(allow_iphone=False, silent=False)
+    for stream in streams:
+        stream_to_piano(stream)
         
 def load_image(path: str) -> np.ndarray:
     """Load an image by path. Falls back to PIL for formats OpenCV may not
@@ -506,10 +542,3 @@ def load_image(path: str) -> np.ndarray:
     from PIL import Image
 
     return cv2.cvtColor(np.array(Image.open(path).convert("RGB")), cv2.COLOR_RGB2BGR)
-
-if __name__ == "__main__":
-    pics_to_piano(sys.argv[1:] if len(sys.argv) > 1 else [
-        "piano_photos/IMG_9064.jpg",
-        "piano_photos/IMG_9066.jpg",
-        "piano_photos/IMG_9073.jpg",
-    ])
