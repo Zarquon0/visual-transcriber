@@ -95,19 +95,26 @@ def build_calibration_data(
     corners_tl_tr_br_bl: np.ndarray,
     far_side: str = "right",
     camera_id: str = "",
+    layout=None,
 ) -> dict:
     """Run detection on a calibration frame and produce the JSON-shape
     dict described in this module's docstring. Caller passes the warp
     corners (in source-image coords) so the same warp can be reproduced
     on live frames.
+
+    ``layout`` controls keyboard span (default LAYOUT_61KEY = C2-C7).
+    Pass LAYOUT_25KEY for a 25-key C4-C6 mini, etc.
     """
     # Local imports keep this module decoupled at import time.
     from key_labeler import (
+        LAYOUT_61KEY,
         _detect_blacks_2d,
         _detect_blacks_1d,
-        _project_to_25,
-        _label_notes_61key,
+        _project_to_canonical,
+        _label_notes,
     )
+    if layout is None:
+        layout = LAYOUT_61KEY
 
     h, w = warped.shape[:2]
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
@@ -122,15 +129,17 @@ def build_calibration_data(
         y_black_bottom = int(0.55 * h)
 
     # Black-key detection (2D primary, 1D fallback) → SWSSW projection.
-    rects_2d, polys_2d = _detect_blacks_2d(gray, y_black_bottom, w, far_side)
+    rects_2d, polys_2d = _detect_blacks_2d(gray, y_black_bottom, w, far_side, layout=layout)
     if len(rects_2d) >= 8:
         b_rects, b_polys = list(rects_2d), list(polys_2d)
     else:
-        b_rects, b_polys = _detect_blacks_1d(gray, y_black_bottom, w)
-    b_rects, b_polys, b_sources = _project_to_25(b_rects, b_polys, w, y_black_bottom)
+        b_rects, b_polys = _detect_blacks_1d(gray, y_black_bottom, w, layout=layout)
+    b_rects, b_polys, b_sources = _project_to_canonical(
+        b_rects, b_polys, w, y_black_bottom, layout=layout,
+    )
 
     centers = sorted(int(rx + rw // 2) for (rx, _, rw, _) in b_rects)
-    bl, wl = _label_notes_61key(centers)
+    bl, wl = _label_notes(centers, layout=layout)
     bl_by_x = {cx: name for cx, name in bl}
 
     keys: list[dict] = []

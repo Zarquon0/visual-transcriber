@@ -98,10 +98,23 @@ def warp_from_corners(img: np.ndarray, corners: np.ndarray,
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: uv run python manual_calibrate.py path/to/photo.jpg")
+        print("usage: uv run python manual_calibrate.py path/to/photo.jpg "
+              "[--layout 61|25] [--far-side right|left]")
         raise SystemExit(2)
 
     img_path = Path(sys.argv[1])
+
+    from key_labeler import LAYOUT_61KEY, LAYOUT_25KEY
+    layout = LAYOUT_61KEY
+    if "--layout" in sys.argv:
+        i = sys.argv.index("--layout")
+        v = sys.argv[i + 1]
+        layout = LAYOUT_25KEY if v == "25" else LAYOUT_61KEY
+    far_side = "right"
+    if "--far-side" in sys.argv:
+        i = sys.argv.index("--far-side")
+        far_side = sys.argv[i + 1]
+
     img = load_image(str(img_path))
 
     corners = pick_corners(img)
@@ -110,7 +123,7 @@ def main():
         print(f"  {label}: ({x:.1f}, {y:.1f})")
 
     warped = warp_from_corners(img, corners, out_height=220)
-    labeled = draw_labels_tight_crop(warped)
+    labeled = draw_labels_tight_crop(warped, far_side=far_side, layout=layout)
 
     out_stem = img_path.with_suffix("")
     warped_path = Path(f"{out_stem}_warped.png")
@@ -127,9 +140,19 @@ def main():
 
     from calibration import build_calibration_data, save_calibration
     keys_data = build_calibration_data(
-        warped, corners, far_side="right", camera_id=img_path.stem
+        warped, corners, far_side=far_side, camera_id=img_path.stem,
+        layout=layout,
     )
     save_calibration(keys_data, keys_path)
+
+    n_total = len(keys_data["keys"])
+    n_blacks = sum(1 for k in keys_data["keys"] if k["type"] == "black")
+    n_whites = n_total - n_blacks
+    n_labeled = sum(1 for k in keys_data["keys"] if k.get("note", "?") not in ("?", ""))
+    print(f"layout: n_octaves={layout.n_octaves} start_octave={layout.start_octave} "
+          f"(expected {layout.n_blacks}b + {layout.n_whites}w = {layout.n_blacks + layout.n_whites})")
+    print(f"detected: {n_total} keys ({n_blacks} black + {n_whites} white), "
+          f"{n_labeled} labeled, {n_total - n_labeled} '?'")
 
     print(
         f"wrote: {warped_path}\n       {labeled_path}\n"

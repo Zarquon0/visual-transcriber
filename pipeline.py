@@ -81,15 +81,22 @@ def open_stream_dual(cfg):
 # ── Calibration + Detector + HandGate builders ──────────────────────────
 
 def calibrate_from_frame(cfg, frame, far_side="right", camera_id="live"):
-    """Calibrate from a single frame, pop the inspector window for that cam."""
+    """Calibrate from a single frame, pop the inspector window for that cam.
+
+    Uses ``cfg.keyboard_layout`` to pick the SWSSW span (61-key C2-C7 by
+    default; 25-key C4-C6 when LAYOUT_25KEY is set in main.py).
+    """
+    layout = getattr(cfg, "keyboard_layout", None)
     result = calibrate_frame(
         frame, top_crop=cfg.top_crop, far_side=far_side, camera_id=camera_id,
+        layout=layout,
     )
     if result is None:
         print(f"auto-calibration failed [{camera_id}]")
         return None, None
     keys_dict, calib_warped, _ = result
-    print(f"calibrated [{camera_id}]: {len(keys_dict['keys'])} keys (far_side={far_side})")
+    print(f"calibrated [{camera_id}]: {len(keys_dict['keys'])} keys "
+          f"(far_side={far_side}, layout={layout})")
     return keys_dict, calib_warped
 
 

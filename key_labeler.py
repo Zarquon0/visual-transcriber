@@ -39,6 +39,7 @@ passes its own ``far_side`` and its results are fused downstream.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -46,6 +47,35 @@ import numpy as np
 
 from seg_to_keys import warp_to_piano #isolate_white, warp_key_lines
 from stream_webcams import open_canon_streams
+
+
+# ── Keyboard layout config ──────────────────────────────────────────────
+# Pipeline supports any C-to-C span; pick a layout per keyboard.
+# 5 black-keys per octave, 7 whites per octave + 1 closing C → black/white
+# counts and the SWSSW gap pattern derive from n_octaves automatically.
+
+@dataclass(frozen=True)
+class KeyboardLayout:
+    n_octaves: int
+    start_octave: int   # leftmost black is C#<start_octave>
+
+    @property
+    def n_blacks(self) -> int:
+        return 5 * self.n_octaves
+
+    @property
+    def n_whites(self) -> int:
+        return 7 * self.n_octaves + 1
+
+    @property
+    def canonical_gaps(self) -> str:
+        """SWSSW pattern truncated to (n_blacks - 1) gap positions."""
+        return ("SWSSW" * self.n_octaves)[: self.n_blacks - 1]
+
+
+# Common presets. Default everywhere is 61-key C2-C7 (the original target).
+LAYOUT_61KEY = KeyboardLayout(n_octaves=5, start_octave=2)   # C2..C7,  25 b / 36 w
+LAYOUT_25KEY = KeyboardLayout(n_octaves=2, start_octave=4)   # C4..C6,  10 b / 15 w
 
 
 def load_image(path: str) -> np.ndarray:
@@ -63,22 +93,24 @@ BLACK_NOTE_SEMITONES = ["C#", "D#", "F#", "G#", "A#"]
 WHITE_NOTE_NAMES = ["C", "D", "E", "F", "G", "A", "B"]
 
 
-def _label_notes_61key(
+def _label_notes(
     black_centers: list[int],
-    start_octave: int = 2,
+    layout: KeyboardLayout = LAYOUT_61KEY,
 ) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """Given N detected black-key center x-positions in warped coords, return
     (black_labels, white_labels) where each entry is ``(x, "NoteName")``.
 
-    Assumes a 61-key board (leftmost black = C#2). If the count differs from
-    25, returns empty lists and lets the caller fall back to geometric-only
-    output. Gap pattern per octave is SWSSW (S = 1 white between adjacent
-    blacks, W = 2 whites between — the E-F and B-C gaps).
+    Assumes a C-to-C span (matches ``layout``). If the count differs
+    from ``layout.n_blacks``, returns empty lists and lets the caller
+    fall back to geometric-only output. Gap pattern per octave is SWSSW
+    (S = 1 white between adjacent blacks, W = 2 whites between — the
+    E-F and B-C gaps).
     """
     n = len(black_centers)
-    if n != 25:
+    if n != layout.n_blacks:
         return [], []
     centers = sorted(black_centers)
+    start_octave = layout.start_octave
     black_labels = [(cx, f"{BLACK_NOTE_SEMITONES[i % 5]}{start_octave + i // 5}")
                     for i, cx in enumerate(centers)]
 
@@ -93,12 +125,12 @@ def _label_notes_61key(
     # Left-of-first white = C{start_octave}.
     white_labels.append((centers[0] - int(small_gap * 0.5), f"C{start_octave}"))
 
-    # Use the CANONICAL SWSSW pattern hardcoded for a 61-key board (5
-    # octaves of black keys: SWSSW * 4 cross-octave Ws + SWSS for the
-    # last partial octave). 24 chars. More robust than per-gap S/W
+    # Canonical SWSSW pattern derived from layout. ``("SWSSW" *
+    # n_octaves)[: n_blacks - 1]`` covers the gaps between consecutive
+    # blacks across the full span. More robust than per-gap S/W
     # classification, which can misclassify borderline wide gaps when
     # perspective compresses the wide-gap differential.
-    canonical = ("SWSSW" * 5)[:24]
+    canonical = layout.canonical_gaps
 
     for i in range(n - 1):
         a, b = centers[i], centers[i + 1]
@@ -128,6 +160,10 @@ def _label_notes_61key(
         if white_idx % 7 == 0:
             octave += 1
     return black_labels, white_labels
+
+
+# Backward-compat alias — old name still works, defaults to 61-key.
+_label_notes_61key = _label_notes
 
 
 # ── Labeler on a tight warp ──────────────────────────────────────────────────
@@ -311,6 +347,7 @@ def _split_blob_by_xclip(
 def _detect_blacks_2d(
     gray: np.ndarray, y_black_bottom: int, w: int,
     far_side: str = "right",
+    layout: KeyboardLayout = LAYOUT_61KEY,
 ) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
     """Direct 2D Otsu connected-component detection of black keys in the
     upper band. Oversized merged blobs (multiple adjacent keys connected
@@ -425,7 +462,7 @@ def _detect_blacks_2d(
     # — likely from Otsu including warp-edge dark artifacts. Trim it.
     # This is symmetric across camera angles because the keyboard's
     # layout doesn't depend on which side the camera is on.
-    white_key_w = w / 36.0
+    white_key_w = w / layout.n_whites
     left_geom_cap = max(2, int(0.5 * white_key_w))
     right_geom_cap = max(left_geom_cap + 1, w - int(1.5 * white_key_w))
 
@@ -465,6 +502,7 @@ def _detect_blacks_2d(
 
 def _detect_blacks_1d(
     gray: np.ndarray, y_black_bottom: int, w: int,
+    layout: KeyboardLayout = LAYOUT_61KEY,
 ) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray | None]]:
     """1D column-projection fallback for black-key detection. Used when 2D
     Otsu can't find the bimodal split (typically top-down warps where the
@@ -493,7 +531,7 @@ def _detect_blacks_1d(
     dark_thr = float(np.mean(dark_thr_arr))
     dark = sm <= dark_thr_arr
     n = len(dark)
-    gap_merge = max(2, int(0.1 * (w / 36)))
+    gap_merge = max(2, int(0.1 * (w / layout.n_whites)))
     i = 0
     while i < n:
         if not dark[i]:
@@ -559,15 +597,17 @@ def _classify_gaps_local(gaps: np.ndarray, window: int = 4, ratio: float = 1.4) 
     return "".join(out)
 
 
-def _project_to_25(
+def _project_to_canonical(
     rects: list[tuple[int, int, int, int]],
     polys: list[np.ndarray | None],
     w: int,
     y_black_bottom: int,
+    layout: KeyboardLayout = LAYOUT_61KEY,
 ) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray | None], list[str]]:
     """Use SWSSW alignment to fill in missing black keys. Returns the full
-    25-key list with each tagged 'detected' or 'inferred'. Inferred keys
-    get template polygons translated from the nearest detected anchor.
+    layout.n_blacks list with each tagged 'detected' or 'inferred'.
+    Inferred keys get template polygons translated from the nearest
+    detected anchor.
     """
     n = len(rects)
     sources = ["detected"] * n
@@ -577,7 +617,7 @@ def _project_to_25(
     widths = [r[2] for r in rects]
     gaps = np.diff(centers)
     gap_classes = _classify_gaps_local(gaps)
-    canonical = ("SWSSW" * 5)[:24]
+    canonical = layout.canonical_gaps
     # Truncate observed if longer than canonical (rare: spurious extra blob).
     cmp_obs = gap_classes[: len(canonical)]
     best_off, best_sc = 0, -1
@@ -591,10 +631,21 @@ def _project_to_25(
             best_sc, best_off = sc, off
     canonical_idx = [best_off + k for k in range(n)]
     s_gaps = [int(g) for g, c in zip(gaps, gap_classes) if c == "S"]
-    s_unit = float(np.median(s_gaps)) if s_gaps else float(w / 36.0)
+    s_unit = float(np.median(s_gaps)) if s_gaps else float(w / layout.n_whites)
+    # Trim observation entries that don't map to a valid canonical
+    # position (ci ∉ [0, n_blacks)). Drops over-counts (e.g. shadow
+    # blob picked up as an extra black) so we never exit with len > n_blacks.
+    keep = [i for i, ci in enumerate(canonical_idx) if 0 <= ci < layout.n_blacks]
+    rects = [rects[i] for i in keep]
+    polys = [polys[i] for i in keep]
+    centers = [centers[i] for i in keep]
+    widths = [widths[i] for i in keep]
+    canonical_idx = [canonical_idx[i] for i in keep]
+    sources = ["detected"] * len(keep)
+    n = len(keep)
     out_rects, out_polys, out_sources = list(rects), list(polys), list(sources)
     assigned = set(canonical_idx)
-    for ci in range(25):
+    for ci in range(layout.n_blacks):
         if ci in assigned:
             continue
         left = right = None
@@ -655,10 +706,17 @@ def _project_to_25(
     )
 
 
+# Backward-compat alias — old name still works, defaults to 61-key.
+_project_to_25 = _project_to_canonical
+
+
 # ── Labeler on a tight warp ──────────────────────────────────────────────────
 
 def draw_labels_tight_crop(
-    warped: np.ndarray, label_notes: bool = True, far_side: str = "right",
+    warped: np.ndarray,
+    label_notes: bool = True,
+    far_side: str = "right",
+    layout: KeyboardLayout = LAYOUT_61KEY,
 ) -> np.ndarray:
     """Annotate a tight-keyboard-crop warped image with detected key features.
 
@@ -700,17 +758,17 @@ def draw_labels_tight_crop(
         y_black_bottom = int(0.55 * h)
 
     # --- Black-key detection: 2D primary, 1D fallback, then SWSSW projection ---
-    rects_2d, polys_2d = _detect_blacks_2d(gray, y_black_bottom, w, far_side)
+    rects_2d, polys_2d = _detect_blacks_2d(gray, y_black_bottom, w, far_side, layout=layout)
     if len(rects_2d) >= 8:
         black_rects = rects_2d
         black_polys: list[np.ndarray | None] = list(polys_2d)
     else:
-        black_rects, black_polys = _detect_blacks_1d(gray, y_black_bottom, w)
+        black_rects, black_polys = _detect_blacks_1d(gray, y_black_bottom, w, layout=layout)
 
     # Geometric fill-in: align detected to canonical SWSSW pattern, project
     # missing keys, copy nearest-detected polygon for each inferred key.
-    black_rects, black_polys, black_sources = _project_to_25(
-        black_rects, black_polys, w, y_black_bottom,
+    black_rects, black_polys, black_sources = _project_to_canonical(
+        black_rects, black_polys, w, y_black_bottom, layout=layout,
     )
 
     black_contours: list[np.ndarray] = []
@@ -724,14 +782,11 @@ def draw_labels_tight_crop(
                 dtype=np.int32,
             ))
 
-    # --- White-key seams: Sobel-x peak detection on the white band.
-    # Sum of |∂I/∂x| down each column gives a strong peak at every seam,
-    # even when the seam itself is only marginally darker than the white
-    # surface (low-contrast side-view warps where a pure column-mean
-    # valley would collapse into noise). We don't depend on the
-    # black-key list for *position*; black-key polygons are used
-    # afterward only by the per-row drawing rule (skip rows where a
-    # polygon covers).
+    # --- White-key seams: derive from the canonical wl label x-positions
+    # if labeling succeeded, else fall back to Sobel-x peak detection.
+    # The label-derived path produces exactly n_whites + 1 seams matching
+    # the keys.json's stored white-key boundaries — the visualization is
+    # then a faithful preview of the data, not an independent estimate.
     band_top = y_black_bottom + int(0.15 * (h - y_black_bottom))
     band_bot = h - 2
     white_band = gray[band_top:band_bot, :] if band_bot > band_top else gray[band_top:, :]
@@ -742,8 +797,23 @@ def draw_labels_tight_crop(
         sorted_gaps_b = np.sort(gaps_b)
         small_gap = float(np.median(sorted_gaps_b[: max(1, len(sorted_gaps_b) // 2)]))
     else:
-        small_gap = w / 36.0
-    if white_band.size > 0:
+        small_gap = w / layout.n_whites
+
+    # Compute white-label positions early so we can use them for seams.
+    bl_early, wl_early = _label_notes(black_centers_sorted, layout=layout)
+    seams_from_labels = False
+    if wl_early:
+        wl_xs = sorted(int(lx) for (lx, _) in wl_early)
+        # Inner seams: midpoints between consecutive white-key labels.
+        inner_seams = [(wl_xs[i] + wl_xs[i + 1]) // 2
+                       for i in range(len(wl_xs) - 1)]
+        # Outer seams: half a white-key width past the outermost labels.
+        left_outer = max(0, int(round(wl_xs[0] - small_gap / 2)))
+        right_outer = min(w - 1, int(round(wl_xs[-1] + small_gap / 2)))
+        seam_peaks = sorted({left_outer, right_outer, *inner_seams})
+        seams_from_labels = True
+
+    if not seam_peaks and white_band.size > 0:
         # Sobel-x highlights vertical-edge transitions — seams are exactly
         # vertical dark lines between bright key surfaces. Sum |∂I/∂x| down
         # each column gives a strong peak at every seam, even when the
@@ -772,8 +842,9 @@ def draw_labels_tight_crop(
     # Geometric gap-fill: where two adjacent detected seams are spaced much
     # wider than the *local* median seam-spacing (window ±3), insert
     # evenly-spaced fill seams. Local median tracks the perspective-induced
-    # spacing drift across the warp on side-view shots.
-    if len(seam_peaks) >= 4:
+    # spacing drift across the warp on side-view shots. Skipped when seams
+    # came from labels — those are already canonical (n_whites + 1).
+    if not seams_from_labels and len(seam_peaks) >= 4:
         seam_gaps = np.diff(seam_peaks)
         filled: list[int] = [seam_peaks[0]]
         for k in range(len(seam_gaps)):
@@ -852,15 +923,15 @@ def draw_labels_tight_crop(
     for poly, src in zip(black_contours, black_sources):
         cv2.drawContours(out, [poly], -1, (255, 0, 0), 2)
 
-    # --- Note labels (assumes 61-key board, leftmost black = C#2) ---
+    # --- Note labels (uses layout for SWSSW pattern + start_octave) ---
     if label_notes:
         black_centers = sorted(int(x + bw_ / 2) for (x, _, bw_, _) in black_rects)
-        bl, wl = _label_notes_61key(black_centers)
+        bl, wl = _label_notes(black_centers, layout=layout)
         font = cv2.FONT_HERSHEY_SIMPLEX
         # Scale: assume labels can stagger across 2 rows, so each label
         # only needs to fit within ≈ 1.7 × the spacing between every-
         # other key.
-        white_key_w = w / 36.0
+        white_key_w = w / layout.n_whites
         target_label_w = 1.5 * white_key_w
         ref_text = "C#3"
         (rw, _), _ = cv2.getTextSize(ref_text, font, 1.0, 2)

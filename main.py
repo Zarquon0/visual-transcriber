@@ -24,6 +24,7 @@ from record import _build_transcribe_lut
 from transcribe import Transcriber
 
 import pipeline
+from key_labeler import LAYOUT_61KEY, LAYOUT_25KEY
 
 
 # ── Camera ──────────────────────────────────────────────────────────────
@@ -34,6 +35,7 @@ FAR_SIDES = ["right", "left"]     # camera-far direction per cam in dual mode
 
 # ── Calibration ─────────────────────────────────────────────────────────
 TOP_CROP = 10                     # pixels of case-top trimmed from the warp output
+KEYBOARD_LAYOUT = LAYOUT_25KEY    # LAYOUT_61KEY (C2-C7) or LAYOUT_25KEY (C4-C6)
 
 # ── Detection (lower = more sensitive / responsive) ────────────────────
 SMOOTH_WINDOW = 1                 # rolling-mean over per-key counts
@@ -61,7 +63,7 @@ DUAL_CAM_VOTE_THRESHOLD = 0.5
 def _build_cfg() -> SimpleNamespace:
     return SimpleNamespace(
         cam_index=CAM_INDEX, cam_indices=CAM_INDICES, far_sides=FAR_SIDES,
-        top_crop=TOP_CROP,
+        top_crop=TOP_CROP, keyboard_layout=KEYBOARD_LAYOUT,
         smooth_window=SMOOTH_WINDOW, press_pixels=PRESS_PIXELS,
         min_blob_area=MIN_BLOB_AREA, boundary_margin=BOUNDARY_MARGIN,
         baseline_frames=BASELINE_FRAMES,

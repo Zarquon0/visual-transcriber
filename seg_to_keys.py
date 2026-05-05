@@ -16,7 +16,7 @@ PEAK_NEIGHBORHOOD    = 5  # a histogram point must exceed all points within this
 GAUSSIAN_KERNEL   = (5, 5)   # blur kernel size (must be odd)
 GAUSSIAN_SIGMA    = 1.0      # blur sigma
 
-MERGE_DIST = 5 # distance to merge blobs before isolating one
+MERGE_DIST = 1 # distance to merge blobs before isolating one
 
 LSD_MERGE_DIST = 20
 
