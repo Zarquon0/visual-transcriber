@@ -33,6 +33,15 @@ CAM_INDEX = 0                     # single-cam OpenCV index (None = auto-detect)
 CAM_INDICES = [0, 1]              # dual-cam indices (cam0, cam1)
 FAR_SIDES = ["right", "left"]     # camera-far direction per cam in dual mode
 
+# ── Recording playback (optional) ───────────────────────────────────────
+# Replay a recorded clip through the live pipeline instead of opening
+# the cameras. Leave as None for normal live capture.
+#   single-cam: set RECORDING_PATH = "recordings/<dir>/cam0.mp4"
+#   dual-cam:   set RECORDING_PATHS = ("recordings/<dir>/cam0.mp4",
+#                                       "recordings/<dir>/cam1.mp4")
+RECORDING_PATH = None             # single-cam recording path
+RECORDING_PATHS = None            # dual-cam recording paths (2-tuple)
+
 # ── Calibration ─────────────────────────────────────────────────────────
 TOP_CROP = 10                     # pixels of case-top trimmed from the warp output
 KEYBOARD_LAYOUT = LAYOUT_25KEY    # LAYOUT_61KEY (C2-C7) or LAYOUT_25KEY (C4-C6)
@@ -47,7 +56,7 @@ BOUNDARY_MARGIN = 1               # px erosion for pixel→key assignment
 BASELINE_FRAMES = 60
 
 # ── HandGate (fingertip-to-key candidate filter) ───────────────────────
-HAND_GATE = True
+HAND_GATE = False
 HAND_GATE_TTL = 5
 HAND_GATE_NEIGHBORS = 1
 
@@ -63,6 +72,7 @@ DUAL_CAM_VOTE_THRESHOLD = 0.5
 def _build_cfg() -> SimpleNamespace:
     return SimpleNamespace(
         cam_index=CAM_INDEX, cam_indices=CAM_INDICES, far_sides=FAR_SIDES,
+        recording_path=RECORDING_PATH, recording_paths=RECORDING_PATHS,
         top_crop=TOP_CROP, keyboard_layout=KEYBOARD_LAYOUT,
         smooth_window=SMOOTH_WINDOW, press_pixels=PRESS_PIXELS,
         min_blob_area=MIN_BLOB_AREA, boundary_margin=BOUNDARY_MARGIN,

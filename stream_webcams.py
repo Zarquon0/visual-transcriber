@@ -273,6 +273,75 @@ class DualCanonStream:
             cap.release()
 
 
+class VideoFileStream:
+    """Replay an .mp4 (or any cv2-readable video) with the same interface as
+    ``CanonStream``: ``start()`` / ``read() -> (bool, frame)`` / ``stop()``.
+
+    Used for offline playback of recorded clips through the live detection
+    pipeline. Frames are stepped on each ``read()`` call (no background
+    thread), and the file loops back to the first frame at EOF so the user
+    has time to calibrate / iterate without re-launching. Pacing matches
+    the source FPS, so the player runs at real-time speed.
+    """
+    def __init__(self, path: str, loop: bool = True):
+        self.path = str(path)
+        self.cap = cv2.VideoCapture(self.path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"VideoFileStream: cannot open {self.path}")
+        self._fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._frame_period = 1.0 / max(self._fps, 1.0)
+        self._loop = loop
+        self._last_read_ts = 0.0
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def read(self) -> tuple[bool, MatLike]:
+        # Pace to source FPS so detection runs at clip speed, not
+        # full throttle. cv2.waitKey() in the main loop also throttles
+        # but only crudely; this matches the recording's wall-clock.
+        now = time.time()
+        wait = self._frame_period - (now - self._last_read_ts)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_read_ts = time.time()
+        grabbed, frame = self.cap.read()
+        if not grabbed and self._loop:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            grabbed, frame = self.cap.read()
+        return grabbed, frame
+
+    def stop(self):
+        self.started = False
+        if self.cap is not None:
+            self.cap.release()
+
+
+class DualVideoFileStream:
+    """Replay two synced video files with the same interface as
+    ``DualCanonStream``: ``start()`` / ``read() -> (frame0, frame1)`` /
+    ``stop()``. Synchronisation is by frame index, not timestamp — both
+    files are assumed to have been captured by ``DualCanonStream`` and
+    thus share a frame count.
+    """
+    def __init__(self, path0: str, path1: str, loop: bool = True):
+        self._streams = [VideoFileStream(p, loop=loop) for p in (path0, path1)]
+
+    def start(self):
+        for s in self._streams:
+            s.start()
+
+    def read(self) -> tuple[MatLike | None, MatLike | None]:
+        g0, f0 = self._streams[0].read()
+        g1, f1 = self._streams[1].read()
+        return (f0 if g0 else None), (f1 if g1 else None)
+
+    def stop(self):
+        for s in self._streams:
+            s.stop()
+
+
 def find_specific_camera_index(prefer: tuple[str, ...]) -> int | None:
     """Pick the first AVFoundation device whose name contains any substring in
     ``prefer``, returning its OpenCV VideoCapture index (or None if no match).

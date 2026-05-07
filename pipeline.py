@@ -55,7 +55,19 @@ def _resize_to_height(img, target_h):
 # ── Camera open ─────────────────────────────────────────────────────────
 
 def open_stream_single(cfg):
-    """Open one Canon. Uses cfg.cam_index when set, else open_canon_streams."""
+    """Open one Canon, or replay a recorded clip if cfg.recording_path is set.
+
+    Recording playback uses ``VideoFileStream`` which exposes the same
+    ``start() / read() / stop()`` interface as ``CanonStream`` and paces
+    frames to the source FPS so the live detection loop runs at clip
+    speed.
+    """
+    rec = getattr(cfg, "recording_path", None)
+    if rec:
+        from stream_webcams import VideoFileStream
+        s = VideoFileStream(rec)
+        s.start()
+        return s
     if cfg.cam_index is not None:
         s = CanonStream(cfg.cam_index, _load_config(), show_stats=False)
         if not s.cap.isOpened():
@@ -70,7 +82,14 @@ def open_stream_single(cfg):
 
 
 def open_stream_dual(cfg):
-    """Open both Canons as a synced DualCanonStream."""
+    """Open both Canons as a synced DualCanonStream, or replay two recorded
+    clips if cfg.recording_paths is a 2-tuple of paths."""
+    recs = getattr(cfg, "recording_paths", None)
+    if recs:
+        from stream_webcams import DualVideoFileStream
+        s = DualVideoFileStream(recs[0], recs[1])
+        s.start()
+        return s
     from stream_webcams import DualCanonStream
     s = DualCanonStream(cfg.cam_indices[0], cfg.cam_indices[1],
                         _load_config(), show_stats=False)
