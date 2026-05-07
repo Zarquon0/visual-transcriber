@@ -1,5 +1,10 @@
 """Visual + sanity validation for ``<photo>_keys.json`` calibration files.
 
+STATUS (current pipeline):
+    Standalone QA utility. Not imported by the live transcription
+    pipeline; used to spot-check saved calibration JSONs for the
+    "wrong note for type" sanity violations described below.
+
 Run::
 
     uv run python validate_calibration.py piano_photos/live_1776972098_keys.json

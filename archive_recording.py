@@ -2,6 +2,11 @@
 artifacts (warp, colored segmentation, manifest) so the data is
 self-describing and reproducible.
 
+STATUS (current pipeline):
+    Standalone CLI utility. Not imported by the live transcription
+    pipeline; run post-hoc to package raw frame folders together with
+    their calibration into a self-describing archive.
+
 Usage:
     uv run python archive_recording.py recordings/<folder>
 

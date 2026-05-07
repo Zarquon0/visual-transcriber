@@ -1,5 +1,13 @@
 """Manual 4-corner calibration tool.
 
+STATUS (current pipeline):
+    Standalone CLI utility. Not imported by ``main.py`` / ``pipeline.py``.
+    Live calibration on the active path is automatic: SPACE in the
+    preview window triggers ``auto_calibrate.calibrate_frame``, which
+    runs corner detection + segmentation in one pass. This script is
+    retained as a debugging fallback for hard inputs where automatic
+    corner detection fails (extreme angles, unusual backgrounds).
+
 Usage:
     uv run python manual_calibrate.py path/to/photo.jpg
 

@@ -1,5 +1,14 @@
 """MediaPipe hand landmark extractor + calibration-aware candidate key gate.
 
+STATUS (current pipeline):
+    Constructed only on the single-camera path (``main.run_single``)
+    when ``HAND_GATE = True`` in ``main.py``. The dual-camera path
+    (``main.run_dual``) force-sets ``cfg.hand_gate = False`` at
+    ``pipeline.py`` line 142, so this module is bypassed entirely
+    in the active dual-cam configuration. Reason: running two
+    MediaPipe instances per frame at 30 fps blows the per-frame
+    budget. Retained as a working option for the single-cam path.
+
 Stage 1 (no calibration):
     gate = HandGate()
     tips = gate.fingertips(raw_bgr)      # raw-frame pixel coords

@@ -273,6 +273,38 @@ class DualCanonStream:
             cap.release()
 
 
+def find_specific_camera_index(prefer: tuple[str, ...]) -> int | None:
+    """Pick the first AVFoundation device whose name contains any substring in
+    ``prefer``, returning its OpenCV VideoCapture index (or None if no match).
+
+    Generalised companion to ``find_canon_indices``: callers that want any one
+    of several device types (e.g. Canon, EOS, iPhone) pass them as a tuple and
+    get the first hit. OpenCV's AVFoundation backend orders external devices
+    before built-in cameras, so the index returned matches that ordering.
+    """
+    swift_code = (
+        'import AVFoundation; '
+        'for d in AVCaptureDevice.devices(for: .video) { '
+        'let flag = d.deviceType == .builtInWideAngleCamera ? "1" : "0"; '
+        'print("\\(d.localizedName)|\\(flag)") }'
+    )
+    r = subprocess.run(
+        ["swift", "-e", swift_code], capture_output=True, text=True, timeout=15
+    )
+    external, builtin = [], []
+    for line in r.stdout.splitlines():
+        if "|" not in line:
+            continue
+        name, flag = line.rsplit("|", 1)
+        (builtin if flag.strip() == "1" else external).append(name.strip())
+    opencv_order = external + builtin
+    for i, name in enumerate(opencv_order):
+        if any(p.lower() in name.lower() for p in prefer):
+            print(f"using device index {i}: {name}")
+            return i
+    return None
+
+
 def open_canon_streams(config_path: Path = _CONFIG_PATH, allow_iphone=False, silent = True) -> list[CanonStream]:
     """Detect all Canon cameras and return a list of opened VideoCapture objects.
 

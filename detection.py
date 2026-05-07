@@ -1,25 +1,44 @@
 """detection.py — unified per-frame press detection.
 
-Single ``Detector`` class consumed by both ``record.py`` (live mode via
-the `d` hotkey) and ``playback.py`` (offline replay). Identical algorithm
-in both — improvements propagate automatically.
+STATUS (current pipeline):
+    Only the diff-only path (``_process_diff``, ~line 1012) is on the
+    live pipeline. ``Detector`` is constructed by ``pipeline.py`` with
+    ``use_diff_only=True``, and the active press signal is:
+        frame difference vs rest baseline
+        → restricted to the top 15% of the warp (where the back-edge
+          tilt cue lives)
+        → connected components → cam-side blob-to-key assignment
+          (rightmost-touched for far_side="left", leftmost-touched
+          for far_side="right").
+    The MediaPipe hand mask still computes for diagnostic visualisation
+    but is intentionally NOT AND-NOT'd into the press signal: its bulky
+    coverage was eating real press signal (see comment at the top of
+    ``_process_diff``).
 
-Channels (each gives a per-key score):
+LEGACY (kept for historical context, not on the live path):
+    The MOG2 background-subtractor and the per-key channel scoring
+    described below — lines / brightness / slope / tempdiff — were
+    earlier exploratory approaches. They are still computed in places
+    for diagnostic panels but their fused output is not consumed.
+
+Channels (legacy, each gives a per-key score):
     * lines     — anomalous-LSD-line length per polygon
     * brightness — pixel intensity delta vs rest mean (skin-masked,
                    global-illumination corrected)
     * slope     — weighted-mean angle of LSD lines, in σ-units of rest
     * tempdiff  — pixel-wise |current − rest_mean| per polygon, σ vs chaos
 
-Fusion (per key type):
+Legacy fusion (per key type):
     blacks → lines OR slope OR tempdiff
     whites → brightness OR slope OR tempdiff
 
-Smoothing: rolling mean over ``smooth_window`` frames per channel before
-threshold comparison. Plus consecutive-frames debounce on the fused flag.
+Smoothing: rolling mean over ``smooth_window`` frames before threshold
+comparison, plus a consecutive-frames debounce on the fired flag —
+both still in use on the diff-only path.
 
 Hand mask: motion + HSV color (adaptive within static-skin envelope) +
 persistence + connected-component blob filter on tight-mask shape.
+Computed but not gating in the active path.
 
 Workflow:
     det = Detector(keys_dict)

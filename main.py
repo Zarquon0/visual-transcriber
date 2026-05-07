@@ -39,8 +39,8 @@ KEYBOARD_LAYOUT = LAYOUT_25KEY    # LAYOUT_61KEY (C2-C7) or LAYOUT_25KEY (C4-C6)
 
 # ── Detection (lower = more sensitive / responsive) ────────────────────
 SMOOTH_WINDOW = 1                 # rolling-mean over per-key counts
-PRESS_PIXELS = 3                  # activated pixels needed per key to fire
-MIN_BLOB_AREA = 1                 # CC area floor (1 disables the filter)
+PRESS_PIXELS = 5               # activated pixels needed per key to fire
+MIN_BLOB_AREA = 1                # CC area floor (1 disables the filter)
 BOUNDARY_MARGIN = 1               # px erosion for pixel→key assignment
 
 # ── Baseline (`b` hotkey) ───────────────────────────────────────────────

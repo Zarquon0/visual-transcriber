@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 
 from stream_webcams import open_canon_streams, CanonStream, _load_config
-from live_test import _find_specific_camera_index
+from stream_webcams import find_specific_camera_index
 
 
 _NOTE_LABEL_TO_ENUM = None
@@ -209,7 +209,7 @@ def open_streams(allow_iphone: bool) -> list[CanonStream]:
             return streams
     except RuntimeError as e:
         print(f"open_canon_streams failed: {e}; trying single-cam fallback")
-    idx = _find_specific_camera_index(("EOS", "Canon", "iPhone"))
+    idx = find_specific_camera_index(("EOS", "Canon", "iPhone"))
     if idx is None:
         return []
     cfg = _load_config()
