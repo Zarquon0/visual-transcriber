@@ -41,12 +41,14 @@ For synced dual camera streaming, use the DualCanonStream object in `stream_webc
 `open_canon_streams()` filter rejects all non Canon camera streams by default, but iPhones can be accepted if the `allow_iphone` flag is passed as `True` to the function.
 
 ## Crop/Warp to Piano
-`seg_to_keys.py` contains functionality for cropping/warping the view to fit the piano keys. To give it a test, simply run connect a Canon camera and run the script. You should see a live stream that looks something like the following:
-<img width="1367" height="551" alt="Screenshot 2026-04-25 at 1 40 43 PM" src="https://github.com/user-attachments/assets/ed681501-d025-4cbc-ba7e-69251cf2a138" />
-<img width="1374" height="510" alt="Screenshot 2026-04-25 at 1 39 42 PM" src="https://github.com/user-attachments/assets/682c2714-a4d9-457d-9461-2219474c3e88" />
+`seg_to_keys.py` contains functionality for cropping/warping the view to fit the piano keys. To give it a test, simply run connect a Canon camera and run `uv run seg_to_keys.py`. You should see a live stream that looks something like the following:
+
 <img width="957" height="535" alt="Screenshot 2026-04-28 at 4 20 09 PM" src="https://github.com/user-attachments/assets/5f64c6ac-2ab4-4697-94d5-ec7b1f7d9f19" />
 
 The warping algorithm is now rotationally invariant, so in normal lighting and without an excess of bright objects in frame, it should work well!
+
+## Transcriber
+`transcribe.py` contains the `Transcriber` object, which when updated with key presses, plays them and records them such that a MIDI file may be created from them. This file does not include a self-contained demo, but testing of the transcriber may be performed through `utilities/keyboard_play.py`, which allows you to play and transcribe a 12 semitone octave via the Q row of keys on your keyboard. In order to properly run this script, you must enable Accessibility and Input Monitoring under Privacy and Security for whatever application you run the script with (Terminal, most likely); these are the instructions for Mac, Windows support not currently available :(. 
 
 ## Note Labeling
 
