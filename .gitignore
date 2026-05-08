@@ -15,8 +15,6 @@ batch_result.png
 *_warp_raw.png
 *_trim_compare.png
 *_validate.png
-# MIDI file saves
-midi_outs/*
 
 # NOTE: *_calib.json is NOT ignored — calibration files are reusable per camera mount.
 snapshots/

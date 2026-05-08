@@ -308,28 +308,49 @@ def open_dual_canon_stream(config_path: Path = _CONFIG_PATH, show_stats: bool = 
     cfg = _load_config(config_path)
     return DualCanonStream(indices[0], indices[1], cfg, show_stats=show_stats)
 
-
 if __name__ == "__main__":
-    stream = open_dual_canon_stream(show_stats=True)
-    stream.start()
-
-    frozen = False
-
+    # DEMO: streams all connected webcams until escaped
+    streams = open_canon_streams(silent=False)
+    
+    for stream in streams: stream.start()
     while True:
-        if not frozen:
-            f0, f1 = stream.read()
-            if f0 is not None and f1 is not None:
-                cv2.imshow("Canon 0", f0)
-                cv2.imshow("Canon 1", f1)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == 32:  # space — freeze on last displayed frames
-            frozen = True
-        elif key == 27:  # ESC — quit
+        frames = [stream.read() for stream in streams]
+        if not all(ok for ok, _ in frames):
+            print("Failed to read from one or more cameras")
             break
 
-    stream.stop()
+        for i, (_, frame) in enumerate(frames):
+            cv2.imshow(f"cam{i}", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:  # ESC
+            # NOTE: this doesn't seem to be working at the moment - just ^C twice to quit
+            break
+
+    for stream in streams:
+        stream.stop()
     cv2.destroyAllWindows()
+
+# if __name__ == "__main__":
+#     stream = open_dual_canon_stream(show_stats=True)
+#     stream.start()
+
+#     frozen = False
+
+#     while True:
+#         if not frozen:
+#             f0, f1 = stream.read()
+#             if f0 is not None and f1 is not None:
+#                 cv2.imshow("Canon 0", f0)
+#                 cv2.imshow("Canon 1", f1)
+
+#         key = cv2.waitKey(1) & 0xFF
+#         if key == 32:  # space — freeze on last displayed frames
+#             frozen = True
+#         elif key == 27:  # ESC — quit
+#             break
+
+#     stream.stop()
+#     cv2.destroyAllWindows()
 
 
 # if __name__ == "__main__":
@@ -348,27 +369,5 @@ if __name__ == "__main__":
 #             break
 
 #     stream.stop()
-#     cv2.destroyAllWindows()
-
-# if __name__ == "__main__":
-#     # DEMO: streams all connected webcams until escaped
-#     streams = open_canon_streams(silent=False)
-    
-#     for stream in streams: stream.start()
-#     while True:
-#         frames = [stream.read() for stream in streams]
-#         if not all(ok for ok, _ in frames):
-#             print("Failed to read from one or more cameras")
-#             break
-
-#         for i, (_, frame) in enumerate(frames):
-#             cv2.imshow(f"cam{i}", frame)
-
-#         if cv2.waitKey(1) & 0xFF == 27:  # ESC
-#             # NOTE: this doesn't seem to be working at the moment - just ^C twice to quit
-#             break
-
-#     for stream in streams:
-#         stream.stop()
 #     cv2.destroyAllWindows()
 

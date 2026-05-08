@@ -144,3 +144,20 @@ if segments is not None and len(segments) > 0:
 #             break
 #     stream.stop()
 #     cv2.destroyAllWindows()
+
+# def load_image(path: str) -> np.ndarray:
+#     """Load an image by path. Falls back to PIL for formats OpenCV may not
+#     ship with (e.g. AVIF on some builds)."""
+#     img = cv2.imread(path)
+#     if img is not None:
+#         return img
+#     from PIL import Image
+
+#     return cv2.cvtColor(np.array(Image.open(path).convert("RGB")), cv2.COLOR_RGB2BGR)
+
+# def pics_to_piano(paths: list[str], window_name: str = "keyboard_stream"):
+#     for path in paths:
+#         img = load_image(path)
+#         warped, _, _ = warp_to_piano(img, debug=True)
+#         cv2.imshow(window_name, warped)
+#         cv2.waitKey(0)
