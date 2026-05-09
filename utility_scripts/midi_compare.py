@@ -3,23 +3,28 @@
 Pipeline
 --------
 1. Parse both files into (start, end, midi_note) note events.
-2. Normalize: shift each file so its first note starts at t=0.
-3. Octave correction: if the first notes share the same pitch class but
+2. Trim transcription: if any gap between consecutive notes is ≥
+   pause_threshold (default 5 s), discard every note before the first
+   such gap so spurious early presses don't pollute the comparison.
+3. Normalize: shift each file so its first note starts at t=0.
+4. Octave correction: if the first notes share the same pitch class but
    differ in octave, shift ALL transcription pitches by that octave
    delta so the systematic offset doesn't penalize accuracy.
-4. One-to-one greedy matching: for each (GT note, transcription note) pair
+5. One-to-one greedy matching: for each (GT note, transcription note) pair
    with the same pitch and |midpoint_gt − midpoint_trans| ≤ THRESHOLD,
    greedily assign the closest pair first.
-5. Accuracy = matched GT notes / total GT notes.
-6. Visualize: piano-roll with GT bars (blue), accurate trans bars (green),
+6. Accuracy = matched GT notes / total GT notes.
+7. Visualize: piano-roll with GT bars (blue), accurate trans bars (green),
    inaccurate trans bars (red), and unmatched GT bars (light blue outline).
 
 Usage
 -----
     uv run python utility_scripts/midi_compare.py ground_truth.mid transcription.mid
     uv run python utility_scripts/midi_compare.py gt.mid trans.mid --threshold 0.5
+    uv run python utility_scripts/midi_compare.py gt.mid trans.mid --pause-threshold 3.0
     uv run python utility_scripts/midi_compare.py gt.mid trans.mid --no-plot
 """
+
 from __future__ import annotations
 
 import argparse
@@ -81,6 +86,47 @@ def normalize_start(notes: list[Note]) -> list[Note]:
         return notes
     offset = notes[0].start
     return [Note(n.start - offset, n.end - offset, n.pitch) for n in notes]
+
+
+def trim_before_long_pause(notes: list[Note], pause_threshold: float) -> list[Note]:
+    """Keep only notes after the last inter-note gap >= pause_threshold seconds.
+
+    The gap is measured from the end of one note to the start of the next, so
+    overlapping / legato notes (negative gap) are never treated as a pause.
+    Returns the original list unchanged if no qualifying gap is found.
+    """
+    last_pause_idx = None
+    for i in range(1, len(notes)):
+        gap = notes[i].start - notes[i - 1].end
+        if gap >= pause_threshold:
+            last_pause_idx = i
+
+    if last_pause_idx is None:
+        return notes
+
+    gap = notes[last_pause_idx].start - notes[last_pause_idx - 1].end
+    print(
+        f"last long pause ({gap:.1f}s) before note {last_pause_idx} at "
+        f"t={notes[last_pause_idx].start:.2f}s — trimming {last_pause_idx} leading note(s)"
+    )
+    return notes[last_pause_idx:]
+
+
+def scale_to_gt_duration(gt: list[Note], trans: list[Note]) -> tuple[list[Note], float]:
+    """Linearly stretch or compress trans so its total duration matches gt's.
+
+    Duration is the end time of the last-ending note in each file.  Both
+    lists must already be normalized to t=0.  Returns (scaled_trans, scale_factor).
+    """
+    if not gt or not trans:
+        return trans, 1.0
+    gt_end    = max(n.end for n in gt)
+    trans_end = max(n.end for n in trans)
+    if trans_end == 0:
+        return trans, 1.0
+    scale = gt_end / trans_end
+    print(f"time scaling: trans {trans_end:.2f}s → {gt_end:.2f}s (×{scale:.4f})")
+    return [Note(n.start * scale, n.end * scale, n.pitch) for n in trans], scale
 
 
 def apply_octave_correction(gt: list[Note], trans: list[Note]) -> tuple[list[Note], int]:
@@ -227,7 +273,7 @@ def plot_comparison(
     ]
     fig.legend(handles=legend_patches, loc="upper right", fontsize=8, ncol=2)
     fig.suptitle(
-        f"MIDI comparison  |  threshold ±{threshold}s  |  accuracy {accuracy:.1f}%  "
+        f"MIDI comparison  |  threshold ±{threshold}  |  accuracy {accuracy:.1f}%  "
         f"({sum(gt_matched)}/{len(gt_matched)} GT notes matched)",
         fontsize=11,
     )
@@ -246,12 +292,17 @@ def main():
         help="midpoint match window in seconds (default 0.3)",
     )
     ap.add_argument(
+        "--pause-threshold", type=float, default=2.0,
+        help="gap (seconds) between consecutive transcription notes that "
+             "triggers trimming of all preceding notes (default 5.0)",
+    )
+    ap.add_argument(
         "--no-plot", action="store_true",
         help="skip the matplotlib visualization",
     )
     args = ap.parse_args()
 
-    gt_raw   = parse_midi(args.ground_truth)
+    gt_raw    = parse_midi(args.ground_truth)
     trans_raw = parse_midi(args.transcription)
 
     if not gt_raw:
@@ -261,9 +312,15 @@ def main():
         print("transcription MIDI contains no notes", file=sys.stderr)
         sys.exit(1)
 
+    trans_raw = trim_before_long_pause(trans_raw, args.pause_threshold)
+    if not trans_raw:
+        print("transcription is empty after pause-trimming", file=sys.stderr)
+        sys.exit(1)
+
     gt    = normalize_start(gt_raw)
     trans = normalize_start(trans_raw)
 
+    trans, time_scale = scale_to_gt_duration(gt, trans)
     trans, octave_shift = apply_octave_correction(gt, trans)
 
     gt_matched, trans_matched = match_notes(gt, trans, args.threshold)
@@ -278,6 +335,8 @@ def main():
     print(f"Ground truth notes : {n_gt}")
     print(f"Transcription notes: {n_trans}")
     print(f"Threshold          : ±{args.threshold}s")
+    if abs(time_scale - 1.0) > 0.001:
+        print(f"Time scale         : ×{time_scale:.4f}")
     if octave_shift:
         print(f"Octave shift       : {octave_shift:+d} semitones applied to transcription")
     print()

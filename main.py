@@ -31,7 +31,7 @@ from key_labeler import LAYOUT_61KEY, LAYOUT_25KEY
 DUAL_CAM = True
 CAM_INDEX = 0                     # single-cam OpenCV index (None = auto-detect)
 CAM_INDICES = [0, 1]              # dual-cam indices (cam0, cam1)
-FAR_SIDES = ["right", "left"]     # camera-far direction per cam in dual mode
+FAR_SIDES = ["left", "right"]     # camera-far direction per cam in dual mode
 
 # ── Recording playback (optional) ───────────────────────────────────────
 # Replay a recorded clip through the live pipeline instead of opening
@@ -43,20 +43,20 @@ RECORDING_PATH = None             # single-cam recording path
 RECORDING_PATHS = None            # dual-cam recording paths (2-tuple)
 
 # ── Calibration ─────────────────────────────────────────────────────────
-TOP_CROP = 10                     # pixels of case-top trimmed from the warp output
-KEYBOARD_LAYOUT = LAYOUT_25KEY    # LAYOUT_61KEY (C2-C7) or LAYOUT_25KEY (C4-C6)
+TOP_CROP = 8                     # pixels of case-top trimmed from the warp output
+KEYBOARD_LAYOUT = LAYOUT_61KEY    # LAYOUT_61KEY (C2-C7) or LAYOUT_25KEY (C4-C6)
 
 # ── Detection (lower = more sensitive / responsive) ────────────────────
 SMOOTH_WINDOW = 1                 # rolling-mean over per-key counts
 PRESS_PIXELS = 5               # activated pixels needed per key to fire
 MIN_BLOB_AREA = 1                # CC area floor (1 disables the filter)
-BOUNDARY_MARGIN = 1               # px erosion for pixel→key assignment
+BOUNDARY_MARGIN = 1               # px erosion for pixel→key assignment (0 = off; cam-side rule handles cross-fire)
 
 # ── Baseline (`b` hotkey) ───────────────────────────────────────────────
 BASELINE_FRAMES = 60
 
 # ── HandGate (fingertip-to-key candidate filter) ───────────────────────
-HAND_GATE = False
+HAND_GATE = True
 HAND_GATE_TTL = 5
 HAND_GATE_NEIGHBORS = 1
 
@@ -144,12 +144,13 @@ def run_dual(cfg):
     build per-cam Detector + per-cam coverage weights → run fused
     detection loop → save MIDI on ESC.
 
-    HandGate is forced off in dual-mode: it would add a second MediaPipe
-    inference per cam (4 total per frame), pushing us over the 33 ms
-    budget at 30 fps. The Detector's own MP-aware hand mask already
-    excludes hand pixels in the diff, which is the dominant guard.
+    HandGate was previously force-disabled in dual mode for latency
+    reasons (4 MediaPipe calls per frame: 2× Detector + 2× HandGate).
+    Now that the active diff path no longer consumes the Detector's
+    hand mask, the budget is back in our favour, so HandGate is left
+    under control of the HAND_GATE constant in this file.
     """
-    cfg.hand_gate = False  # see docstring — MP cost prohibitive in dual
+    # cfg.hand_gate = False  # legacy force-disable, kept commented for context
     stream = pipeline.open_stream_dual(cfg)
     transcriber, hand_gates = None, [None, None]
     try:

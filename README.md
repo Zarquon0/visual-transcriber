@@ -52,7 +52,10 @@ desync). Run `uv run python stream_webcams.py` to confirm both feeds
 are live.
 
 Resolution and FPS are read from `config.yaml`. Single-camera mode also
-works: set `DUAL_CAM = False` in `main.py` and adjust `CAM_INDEX`.
+works: set `DUAL_CAM = False` in `main.py` and adjust `CAM_INDEX`. iPhone
+Continuity Camera works as a fallback source — pass `allow_iphone=True`
+to `open_canon_streams` (in `stream_webcams.py`) if no Canon is
+connected.
 
 ### Audio (required — Transcriber is constructed at startup)
 
@@ -162,6 +165,33 @@ only on the single-camera path. Dual-cam mode forces it off because
 running two MediaPipe instances per frame at 30 fps blows the
 per-frame budget.
 
+### Recording playback (offline replay)
+
+Instead of opening cameras live, `main.py` can replay a recorded clip
+through the same pipeline. Set the constants near the top of
+`main.py`:
+
+```python
+RECORDING_PATH  = "recordings/<dir>/cam0.mp4"   # single-cam mode
+RECORDING_PATHS = ("recordings/<dir>/cam0.mp4",
+                   "recordings/<dir>/cam1.mp4")  # dual-cam mode
+```
+
+Bundled fixtures: `recordings/1777663774_rest/`, `1777663818_chaos/`,
+and `1777663914_press/` each contain a `cam0.mp4` plus a `cam0_keys.json`
+calibration. The clip plays at its source FPS and loops at EOF.
+
+### Transcriber
+
+`transcribe.py` exposes the `Transcriber` object that the live pipeline
+updates with the fused press set each frame. It plays each note through
+fluidsynth in real time and records note-on / note-off events, writing
+a MIDI file to `midi_outs/<timestamp>.mid` on exit. The bundled MIDI
+files in `midi_outs/` (e.g. `c_scale_gnd.mid` / `c_scale_trans.mid`,
+`chroma_*`, `Full song.mid`, `full_song_trans.mid`) are ground-truth
+plus matching transcription pairs used to evaluate the pipeline; pass
+them to `utility_scripts/midi_compare.py` for note-level accuracy.
+
 ---
 
 ## Standalone scripts
@@ -180,6 +210,7 @@ These are not part of the live pipeline — run them on their own.
 | `utility_scripts/cam_probe.py`     | Open camera indices 0..4 and print which ones connect — sanity-check before launching `main.py`. |
 | `utility_scripts/cam_identify.py`  | Open a single camera index and display its feed — confirm which physical camera is which index. |
 | `utility_scripts/midi_compare.py`  | Score a transcribed MIDI against a ground-truth MIDI (note-level F1).        |
+| `utility_scripts/keyboard_play.py` | Play and transcribe a 12-semitone octave via the Q-row of your laptop keyboard — handy for testing `Transcriber` without the cameras. Requires Accessibility + Input Monitoring permissions for your terminal on macOS. |
 
 Example:
 
@@ -208,7 +239,6 @@ contents:
 | `batch_test.py`            | Photo-grid batch tester (depended on `key_extractor2`, broken).       |
 | `key_detection.py`         | Older `KeyDetector` style — read dead JSON fields.                    |
 | `live_labeler.py`          | Predecessor to `key_labeler.draw_labels_tight_crop`.                  |
-| `keyboard_play.py`         | Laptop-keyboard-as-piano test, unrelated to transcription.            |
 | `live_test.py`             | Early "grab a frame and display" smoke test. Its single useful helper (`find_specific_camera_index`) lives in `stream_webcams.py` now. |
 
 ---

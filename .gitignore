@@ -3,6 +3,7 @@ __pycache__/
 
 # Dev tooling metadata (not part of the project).
 .claude/
+.DS_Store
 
 # MediaPipe Hand Landmarker model — downloaded by user (see README).
 hand_landmarker.task
