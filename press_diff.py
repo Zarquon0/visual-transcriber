@@ -5,78 +5,10 @@ from stream_webcams import CanonStream, open_canon_streams
 from seg_to_keys import warp_to_piano, warp_key_lines, WHITE_PEAK_TOLERANCE
 from calibration import build_calibration_data
 
-DIFF_PEAK_MIN_L  = 0     # peaks at or below this L value are ignored as too-dark-to-matter
+#DIFF_PEAK_MIN_L  = 0     # peaks at or below this L value are ignored as too-dark-to-matter
+DIFF_TRESH = 75
 BLOB_TOP_FRAC    = 0.15  # fraction of image height that counts as "top"
 BLOB_TOP_THRESH  = 3     # minimum pixels a blob must have in the top region to be kept
-
-# press    = load_image("piano_photos/press.png")
-# no_press = load_image("piano_photos/no_press.png")
-
-# ph, pw = press.shape[:2]
-# nh, nw = no_press.shape[:2]
-
-# if (pw, ph) != (nw, nh):
-#     if pw * ph > nw * nh:
-#         press = cv2.resize(press, (nw, nh), interpolation=cv2.INTER_AREA)
-#     else:
-#         no_press = cv2.resize(no_press, (pw, ph), interpolation=cv2.INTER_AREA)
-
-# press_gray    = cv2.cvtColor(press,    cv2.COLOR_BGR2GRAY)
-# no_press_gray = cv2.cvtColor(no_press, cv2.COLOR_BGR2GRAY)
-
-# diff = cv2.absdiff(press_gray, no_press_gray)
-
-# cv2.imshow("press - no_press diff", diff)
-# cv2.waitKey(0)
-# cv2.destroyAllWindows()
-
-# def isolate_white_all_peaks(frame: np.ndarray) -> None:
-#     """Display a masked image for every L-channel histogram peak, plus an annotated histogram.
-
-#     Generates the same histogram as isolate_white(), then produces one mask per peak
-#     (rather than just the rightmost one) and displays them all in a mosaic. Also calls
-#     _draw_hist_debug_all_peaks() to show the histogram with each peak marked by index.
-#     """
-#     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-#     l_channel = lab[:, :, 0]
-#     n_pixels = frame.shape[0] * frame.shape[1]
-#     hist = cv2.calcHist([l_channel], [0], None, [256], [0, 256]).flatten()
-#     smoothed = np.convolve(hist, np.ones(35) / 35, mode='same')
-#     min_height = n_pixels * 0.0015
-#     peak_idxs = [
-#         i for i in range(1, 255)
-#         if smoothed[i] >= min_height
-#         and all(
-#             smoothed[i] > smoothed[j]
-#             for j in range(max(0, i - PEAK_NEIGHBORHOOD), min(256, i + PEAK_NEIGHBORHOOD + 1))
-#             if j != i
-#         )
-#     ]
-#     if not peak_idxs:
-#         peak_idxs = [int(np.argmax(smoothed))]
-#     l = l_channel.astype(np.int16)
-#     named_frames = []
-#     for idx, peak in enumerate(peak_idxs):
-#         mask = (l >= peak - WHITE_PEAK_TOLERANCE) & (l <= peak + WHITE_PEAK_TOLERANCE)
-#         result = np.where(np.stack([mask] * 3, axis=2), 255, 0).astype(np.uint8)
-#         named_frames.append((f'peak {idx}  L={peak}', result))
-#     cv2.imshow("L-channel histogram (all peaks)", _draw_hist_debug_all_peaks(smoothed, peak_idxs))
-#     cv2.imshow("All peak masks", make_mosaic(named_frames))
-#     cv2.waitKey(0)
-
-# def white_balance(frame: np.ndarray) -> np.ndarray:
-#     """Correct the white balance of frame using isolated white pixels as the reference.
-
-#     Applies isolate_white() to find white-key pixels, computes their mean BGR in the
-#     original image, then scales each channel so that mean maps to 255.
-#     """
-#     white_mask_bgr = isolate_white(frame)
-#     mask = white_mask_bgr[:, :, 0] > 0
-#     if not mask.any():
-#         return frame.copy()
-#     mean_bgr = frame[mask].astype(np.float32).mean(axis=0)
-#     scale = np.where(mean_bgr > 0, 255.0 / mean_bgr, 1.0)
-#     return np.clip(frame.astype(np.float32) * scale[np.newaxis, np.newaxis, :], 0, 255).astype(np.uint8)
 
 def filter_blobs_by_top_presence(mask: np.ndarray) -> np.ndarray:
     """Keep only blobs that have at least BLOB_TOP_THRESH pixels in the top BLOB_TOP_FRAC of the image."""
@@ -113,7 +45,7 @@ def isolate_diff_peak(gray: np.ndarray) -> np.ndarray:
     # peak = peak_idxs[-1]
     g = gray.astype(np.int16)
     #mask = (g >= peak - WHITE_PEAK_TOLERANCE) & (g <= peak + WHITE_PEAK_TOLERANCE)
-    mask = (g >= 75)
+    mask = (g >= DIFF_THRESH)
     return np.where(mask, 255, 0).astype(np.uint8)
 
 def detect_press_regions(live_warped: np.ndarray, stored_warped: np.ndarray) -> np.ndarray:
