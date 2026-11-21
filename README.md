@@ -7,7 +7,7 @@ on a 61-key C2–C7 keyboard.
 
 CSCI 1430 final project, Spring 2026.
 
----
+<img width="1136" height="853" alt="Screenshot 2026-11-21 at 11 11 52 AM 1" src="https://github.com/user-attachments/assets/ebd5927d-a9eb-4f60-b762-b7db6b823cd7" />
 
 ## Quick start
 
